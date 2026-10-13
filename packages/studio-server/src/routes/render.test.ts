@@ -33,12 +33,36 @@ function createAdapter(
   return { adapter, rendersDir };
 }
 
-function buildApp(spy: ReturnType<typeof vi.fn>): { app: Hono; cleanup: () => void } {
+function buildApp(spy: ReturnType<typeof vi.fn>): {
+  app: Hono;
+  rendersDir: string;
+  cleanup: () => void;
+} {
   const { adapter, rendersDir } = createAdapter(spy);
   const app = new Hono();
   registerRenderRoutes(app, adapter);
-  return { app, cleanup: () => rmSync(rendersDir, { recursive: true, force: true }) };
+  return { app, rendersDir, cleanup: () => rmSync(rendersDir, { recursive: true, force: true }) };
 }
+
+describe("GET /projects/:id/renders — stale sidecar status", () => {
+  it("does not mark an existing output failed from stale metadata", async () => {
+    const spy = vi.fn();
+    const { app, rendersDir, cleanup } = buildApp(spy);
+    try {
+      writeFileSync(join(rendersDir, "retry.mp4"), "valid-output");
+      writeFileSync(
+        join(rendersDir, "retry.meta.json"),
+        JSON.stringify({ status: "failed", error: "first attempt" }),
+      );
+      const res = await app.request("http://localhost/projects/demo/renders");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.renders).toEqual([expect.objectContaining({ id: "retry", status: "complete" })]);
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 describe("POST /projects/:id/render — outputResolution forwarding", () => {
   it("forwards a valid resolution preset to the adapter", async () => {
@@ -100,6 +124,42 @@ describe("POST /projects/:id/render — outputResolution forwarding", () => {
       cleanup();
     }
   });
+
+  // Contract pin per PR #2529 R2 review: the HTTP route accepts canonical
+  // presets only, not the CLI-side tier aliases (`1080p` / `hd` / `4k` /
+  // `uhd`, `landscape-4k` is already canonical). Miga asked that Studio
+  // Server's contract stay explicit here rather than silently extending it.
+  // Aliases fall through to the same `undefined` sink as any unknown value,
+  // which means the render falls back to composition dimensions — a safe,
+  // deliberate no-op rather than a portrait-1080p failure mode.
+  it.each(["1080p", "4k", "hd", "uhd"])(
+    "does NOT accept the CLI-side tier alias %s (canonical-only contract)",
+    async (alias) => {
+      const spy = vi.fn();
+      const { app, cleanup } = buildApp(spy);
+      try {
+        const res = await app.request("http://localhost/projects/demo/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            fps: 30,
+            quality: "standard",
+            format: "mp4",
+            resolution: alias,
+          }),
+        });
+        expect(res.status).toBe(200);
+        // Alias falls through to undefined → render uses composition dims.
+        // If Studio Server ever extends its contract to accept aliases,
+        // it must also plumb `outputResolutionAspectAgnostic` alongside so
+        // the compile stage can remap orientation; today the surface is
+        // deliberately narrow.
+        expect(spy.mock.calls[0][0].outputResolution).toBeUndefined();
+      } finally {
+        cleanup();
+      }
+    },
+  );
 
   it("accepts each canonical preset value", async () => {
     for (const preset of VALID_CANVAS_RESOLUTIONS) {
@@ -396,6 +456,103 @@ describe("GET /projects/:id/renders/file/* — path safety", () => {
     tmpDirs.length = 0;
   });
 
+  it("serves non-Latin-1 filenames with RFC 6266 content dispositions", async () => {
+    const filename = "測試.mp4";
+    const { app, rendersDir } = buildApp();
+    const outputPath = join(rendersDir, filename);
+    writeFileSync(outputPath, "render-bytes");
+
+    const listResponse = await app.request("http://localhost/projects/demo/renders");
+    expect(listResponse.status).toBe(200);
+    const jobId = encodeURIComponent(filename.replace(/\.mp4$/, ""));
+    const expectedFilename = `filename="__.mp4"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+    const responses = [
+      {
+        response: await app.request(`http://localhost/render/${jobId}/view`),
+        disposition: "inline",
+      },
+      {
+        response: await app.request(`http://localhost/render/${jobId}/download`),
+        disposition: "attachment",
+      },
+      {
+        response: await app.request(
+          `http://localhost/projects/demo/renders/file/${encodeURIComponent(filename)}`,
+        ),
+        disposition: "inline",
+      },
+    ];
+
+    for (const { response, disposition } of responses) {
+      expect(response.status).toBe(200);
+      const header = response.headers.get("Content-Disposition");
+      expect(header).toBe(`${disposition}; ${expectedFilename}`);
+      expect(header).toMatch(/^[\x20-\x7e]+$/);
+    }
+  });
+
+  it("refuses the desktop app's records when renders/ is linked into .hyperframes/", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-renders-project-"));
+    tmpDirs.push(project);
+    mkdirSync(join(project, ".hyperframes"));
+    writeFileSync(join(project, ".hyperframes", "app-history.jsonl"), '{"asked":"secret"}');
+    if (!tryCreateSymlink(join(project, ".hyperframes"), join(project, "renders"), "dir")) return;
+    const app = new Hono();
+    registerRenderRoutes(app, {
+      listProjects: () => [],
+      resolveProject: async (id: string) => ({ id, dir: project }),
+      bundle: async () => null,
+      lint: async () => ({ findings: [] }),
+      runtimeUrl: "/api/runtime.js",
+      rendersDir: () => join(project, "renders"),
+      startRender: (opts) => ({
+        id: opts.jobId,
+        status: "rendering",
+        progress: 0,
+        outputPath: opts.outputPath,
+      }),
+    });
+    const res = await app.request("http://localhost/projects/demo/renders/file/app-history.jsonl");
+    expect(res.status).toBe(403);
+    expect(await res.text()).not.toContain("secret");
+  });
+
+  it("never lists, views or downloads a render that links to the app's records", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-renders-project-"));
+    tmpDirs.push(project);
+    mkdirSync(join(project, ".hyperframes"));
+    mkdirSync(join(project, "renders"));
+    writeFileSync(join(project, ".hyperframes", "app-history.jsonl"), '{"asked":"secret"}');
+    writeFileSync(join(project, "renders", "real.mp4"), "render-bytes");
+    const leak = join(project, "renders", "leak.mp4");
+    if (!tryCreateSymlink(join(project, ".hyperframes", "app-history.jsonl"), leak, "file")) return;
+    const app = new Hono();
+    registerRenderRoutes(app, {
+      listProjects: () => [],
+      resolveProject: async (id: string) => ({ id, dir: project }),
+      bundle: async () => null,
+      lint: async () => ({ findings: [] }),
+      runtimeUrl: "/api/runtime.js",
+      rendersDir: () => join(project, "renders"),
+      startRender: (opts) => ({
+        id: opts.jobId,
+        status: "rendering",
+        progress: 0,
+        outputPath: opts.outputPath,
+      }),
+    });
+    const list = (await (await app.request("http://localhost/projects/demo/renders")).json()) as {
+      renders: { id: string }[];
+    };
+    expect(list.renders.map((r) => r.id)).toEqual(["real"]);
+    for (const kind of ["view", "download"]) {
+      const res = await app.request(`http://localhost/render/leak/${kind}`);
+      expect(res.status).toBe(404);
+      expect(await res.text()).not.toContain("secret");
+      expect((await app.request(`http://localhost/render/real/${kind}`)).status).toBe(200);
+    }
+  });
+
   it("serves a render file that lives inside rendersDir", async () => {
     const { app, rendersDir } = buildApp();
     writeFileSync(join(rendersDir, "demo.mp4"), "render-bytes");
@@ -426,6 +583,81 @@ describe("GET /projects/:id/renders/file/* — path safety", () => {
     const res = await app.request("http://localhost/projects/demo/renders/file/alias/clip.mp4");
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("nested-bytes");
+  });
+});
+
+describe("POST /render/:jobId/cancel", () => {
+  async function startJob(app: Hono): Promise<string> {
+    const res = await app.request("http://localhost/projects/demo/render", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fps: 30, quality: "standard", format: "mp4" }),
+    });
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { jobId: string }).jobId;
+  }
+
+  it("marks a rendering job cancelled and invokes the adapter abort hook", async () => {
+    const spy = vi.fn();
+    let aborted = false;
+    const { adapter, rendersDir } = createAdapter(spy);
+    const baseStartRender = adapter.startRender.bind(adapter);
+    adapter.startRender = (opts) => {
+      const state = baseStartRender(opts);
+      state.cancel = () => {
+        aborted = true;
+      };
+      return state;
+    };
+    const app = new Hono();
+    registerRenderRoutes(app, adapter);
+    try {
+      const jobId = await startJob(app);
+      const res = await app.request(`http://localhost/render/${jobId}/cancel`, { method: "POST" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { status: string }).status).toBe("cancelled");
+      expect(aborted).toBe(true);
+      // SSE progress for a cancelled job must terminate (status is terminal).
+      const progress = await app.request(`http://localhost/render/${jobId}/progress`);
+      expect(progress.status).toBe(200);
+    } finally {
+      rmSync(rendersDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cancel a job that already completed", async () => {
+    const spy = vi.fn();
+    const states: Array<{ status: string }> = [];
+    const { adapter, rendersDir } = createAdapter(spy);
+    const baseStartRender = adapter.startRender.bind(adapter);
+    adapter.startRender = (opts) => {
+      const state = baseStartRender(opts);
+      states.push(state);
+      return state;
+    };
+    const app = new Hono();
+    registerRenderRoutes(app, adapter);
+    try {
+      const jobId = await startJob(app);
+      const [state] = states;
+      if (state) state.status = "complete";
+      const res = await app.request(`http://localhost/render/${jobId}/cancel`, { method: "POST" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { status: string }).status).toBe("complete");
+    } finally {
+      rmSync(rendersDir, { recursive: true, force: true });
+    }
+  });
+
+  it("404s for unknown jobs", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const res = await app.request("http://localhost/render/nope/cancel", { method: "POST" });
+      expect(res.status).toBe(404);
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -467,6 +699,55 @@ describe("POST /projects/:id/render — telemetryDistinctId forwarding", () => {
     }
   });
 
+  // Explicit suppression, forwarded so the CLI can honour a browser opt-out
+  // it has no other way to observe.
+  it("forwards an explicit telemetryOptOut", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const res = await app.request("http://localhost/projects/demo/render", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          fps: 30,
+          quality: "standard",
+          format: "mp4",
+          telemetryOptOut: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(spy.mock.calls[0][0].telemetryOptOut).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // An old client omits the flag, and a non-boolean is not a signal either.
+  // Defaulting those to "opted out" would silently drop every pre-upgrade
+  // render outcome.
+  it.each([undefined, false, "true"])(
+    "treats telemetryOptOut %s as not opted out",
+    async (flag) => {
+      const spy = vi.fn();
+      const { app, cleanup } = buildApp(spy);
+      try {
+        await app.request("http://localhost/projects/demo/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            fps: 30,
+            quality: "standard",
+            format: "mp4",
+            telemetryOptOut: flag,
+          }),
+        });
+        expect(spy.mock.calls[0][0].telemetryOptOut).toBe(false);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+
   it("ignores a non-string telemetryDistinctId", async () => {
     const spy = vi.fn();
     const { app, cleanup } = buildApp(spy);
@@ -483,6 +764,155 @@ describe("POST /projects/:id/render — telemetryDistinctId forwarding", () => {
       });
       expect(res.status).toBe(200);
       expect(spy.mock.calls[0][0].distinctId).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("POST /projects/:id/render — variables forwarding", () => {
+  it("forwards a variables object to the adapter", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const res = await app.request("http://localhost/projects/demo/render", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          format: "mp4",
+          variables: { title: "Custom", count: 5, dark: true },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(spy).toHaveBeenCalledOnce();
+      expect(spy.mock.calls[0][0].variables).toEqual({ title: "Custom", count: 5, dark: true });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("omits variables from adapter opts when not provided", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const res = await app.request("http://localhost/projects/demo/render", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "mp4" }),
+      });
+      expect(res.status).toBe(200);
+      expect(spy.mock.calls[0][0].variables).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rejects non-object variables payloads with 400 (no silent drop)", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      for (const variables of [["a"], "str", 42, null]) {
+        const res = await app.request("http://localhost/projects/demo/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ format: "mp4", variables }),
+        });
+        expect(res.status).toBe(400);
+      }
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("POST /projects/:id/render — GPU encoding", () => {
+  it("passes gpu: true on an MP4 export to the adapter as useGpu, and anything else as off", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const requests = [
+        { format: "mp4", gpu: true },
+        { format: "mp4" },
+        { format: "mp4", gpu: "true" },
+        { format: "mp4", gpu: 1 },
+        { format: "webm", gpu: true },
+        { format: "mov", gpu: true },
+      ];
+      for (const body of requests) {
+        const res = await app.request("http://localhost/projects/demo/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(res.status).toBe(200);
+      }
+      expect(spy.mock.calls.map(([opts]) => opts.useGpu)).toEqual([
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("audioLoweredDb — the limiter's attenuation reaches the host", () => {
+  async function completedJobProgress(audioLoweredDb: number | undefined): Promise<string> {
+    const spy = vi.fn();
+    const { adapter, rendersDir } = createAdapter(spy);
+    const baseStartRender = adapter.startRender.bind(adapter);
+    adapter.startRender = (opts) => {
+      const state = baseStartRender(opts);
+      state.status = "complete";
+      state.progress = 100;
+      if (audioLoweredDb !== undefined) state.audioLoweredDb = audioLoweredDb;
+      return state;
+    };
+    const app = new Hono();
+    registerRenderRoutes(app, adapter);
+    try {
+      const started = await app.request("http://localhost/projects/demo/render", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fps: 30, quality: "standard", format: "mp4" }),
+      });
+      const { jobId } = (await started.json()) as { jobId: string };
+      return await (await app.request(`http://localhost/render/${jobId}/progress`)).text();
+    } finally {
+      rmSync(rendersDir, { recursive: true, force: true });
+    }
+  }
+
+  it("carries audioLoweredDb in the complete progress event", async () => {
+    const body = await completedJobProgress(1.44);
+    expect(body).toContain('"status":"complete"');
+    expect(body).toContain('"audioLoweredDb":1.44');
+  });
+
+  it("omits it when the limiter did not engage", async () => {
+    expect(await completedJobProgress(undefined)).not.toContain("audioLoweredDb");
+  });
+
+  it("lists it on the render record from the sidecar, and omits it otherwise", async () => {
+    const { app, rendersDir, cleanup } = buildApp(vi.fn());
+    try {
+      writeFileSync(join(rendersDir, "loud.mp4"), "x");
+      writeFileSync(
+        join(rendersDir, "loud.meta.json"),
+        JSON.stringify({ status: "complete", audioLoweredDb: 1.44 }),
+      );
+      writeFileSync(join(rendersDir, "quiet.mp4"), "x");
+      writeFileSync(join(rendersDir, "quiet.meta.json"), JSON.stringify({ status: "complete" }));
+      const { renders } = (await (
+        await app.request("http://localhost/projects/demo/renders")
+      ).json()) as { renders: Array<{ id: string; audioLoweredDb?: number }> };
+      expect(renders.find((r) => r.id === "loud")?.audioLoweredDb).toBe(1.44);
+      expect(renders.find((r) => r.id === "quiet")).not.toHaveProperty("audioLoweredDb");
     } finally {
       cleanup();
     }

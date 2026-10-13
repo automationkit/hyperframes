@@ -1,16 +1,21 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { HINT_KEY_PATTERN } from "./agent_runtime.js";
 
 // agent_runtime.ts reads node:os via release/platform and node:fs for the
 // /proc files. detectAgentRuntime is exercised by mutating process.env;
 // detectSandboxRuntime is exercised through a small set of node:os mocks.
 
 const VENDOR_ENV_KEYS = [
+  "BOBSHELL_CLI",
+  "BOBSHELL_API_KEY",
+  "BOBSHELL_NO_RELAUNCH",
   "CLAUDECODE",
   "CLAUDE_CODE_ENTRYPOINT",
   "CODEX_THREAD_ID",
   "CODEX_CI",
   "CODEX_SANDBOX_NETWORK_DISABLED",
   "TERM_PROGRAM",
+  "CURSOR_AGENT",
   "GITHUB_ACTIONS",
   "COPILOT_AGENT_ID",
   "RUNNER_NAME",
@@ -27,6 +32,10 @@ const VENDOR_ENV_KEYS = [
 
 function stripVendorEnv(): void {
   for (const key of VENDOR_ENV_KEYS) delete process.env[key];
+  // Ambient session keys would otherwise fill the 16-key hint cap.
+  for (const key of Object.keys(process.env)) {
+    if (HINT_KEY_PATTERN.test(key.toUpperCase())) delete process.env[key];
+  }
 }
 
 describe("detectAgentRuntime — base behavior", () => {
@@ -50,6 +59,35 @@ describe("detectAgentRuntime — base behavior", () => {
     expect(detectAgentRuntime()).toBe("claude_code");
   });
 
+  it("detects Cursor Agent without an IDE terminal marker", async () => {
+    process.env["CURSOR_AGENT"] = "1";
+    const { detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectAgentRuntime()).toBe("cursor");
+    process.env["CURSOR_AGENT"] = "";
+    expect(detectAgentRuntime()).toBeNull();
+  });
+
+  it.each([
+    ["CLAUDECODE", "claude_code"],
+    ["CODEX_THREAD_ID", "codex"],
+  ])("keeps child-agent attribution for %s inside Cursor", async (key, runtime) => {
+    process.env["CURSOR_AGENT"] = "1";
+    process.env[key] = "1";
+    const { detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectAgentRuntime()).toBe(runtime);
+  });
+
+  it("keeps the Harbor marker separate from agent attribution and never emits its value", async () => {
+    const { detectExecutionHarnessHint, detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectExecutionHarnessHint()).toBeNull();
+    process.env["HARBOR_AGENT"] = "private-harness-value";
+    expect(detectExecutionHarnessHint()).toBe("harbor");
+    expect(detectAgentRuntime()).toBeNull();
+    process.env["CLAUDECODE"] = "1";
+    expect(detectAgentRuntime()).toBe("claude_code");
+    expect(detectExecutionHarnessHint()).toBe("harbor");
+  });
+
   it("never reads env-var values — even API-key-shaped values stay unread", async () => {
     process.env["CODEX_THREAD_ID"] = "thread-1";
     process.env["CODEX_API_KEY"] = "sk-supersecret-DO-NOT-LEAK";
@@ -58,6 +96,35 @@ describe("detectAgentRuntime — base behavior", () => {
     expect(result).toBe("codex");
     expect(typeof result).toBe("string");
     expect((result ?? "").includes("supersecret")).toBe(false);
+  });
+});
+
+describe("detectAgentRuntime — IBM Bob Shell", () => {
+  const savedEnv = { ...process.env };
+  beforeEach(stripVendorEnv);
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  it("detects via BOBSHELL_CLI (set on both shell execution paths)", async () => {
+    process.env["BOBSHELL_CLI"] = "1";
+    const { detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectAgentRuntime()).toBe("bob");
+  });
+
+  it("wins over inherited outer-agent markers as the immediate executor", async () => {
+    process.env["BOBSHELL_CLI"] = "1";
+    process.env["CLAUDECODE"] = "1";
+    process.env["CODEX_THREAD_ID"] = "thread-1";
+    const { detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectAgentRuntime()).toBe("bob");
+  });
+
+  it("does not treat Bob authentication or relaunch state as execution proof", async () => {
+    process.env["BOBSHELL_API_KEY"] = "secret-not-read";
+    process.env["BOBSHELL_NO_RELAUNCH"] = "true";
+    const { detectAgentRuntime } = await import("./agent_runtime.js");
+    expect(detectAgentRuntime()).toBeNull();
   });
 });
 
@@ -327,6 +394,115 @@ describe("detectAgentRuntime — Windsurf / Cline / Gemini CLI / Crush", () => {
     process.env["GEMINI_CLI"] = "anything";
     const { detectAgentRuntime } = await import("./agent_runtime.js");
     expect(detectAgentRuntime()).toBe("gemini_cli");
+  });
+});
+
+describe("detectAgentHints — new-agent discovery signals", () => {
+  const savedEnv = { ...process.env };
+  beforeEach(() => {
+    stripVendorEnv();
+    // stripVendorEnv clears TERM_PROGRAM; also clear the value-captured generics
+    // and any hint-shaped keys a test sets so assertions stay deterministic.
+    delete process.env["AGENT"];
+    delete process.env["AI_AGENT"];
+  });
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  it("reads AGENT as the agent_hint (self-identification convention), lowercased", async () => {
+    process.env["AGENT"] = "Crush";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_hint).toBe("crush");
+  });
+
+  it("falls back to AI_AGENT when AGENT is unset", async () => {
+    process.env["AI_AGENT"] = "goose";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_hint).toBe("goose");
+  });
+
+  it("drops an overlong secret-looking AGENT value rather than leaking it", async () => {
+    process.env["AGENT"] = "sk-ant-api03-THIS-IS-A-LONG-SECRET-LOOKING-VALUE-xyz";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_hint).toBeNull();
+  });
+
+  // The short-slug allowlist alone accepts these; the credential-shape guard
+  // (prefixes + long alnum runs) is what actually enforces the privacy claim.
+  it.each([
+    ["sk-ant-api03", "token prefix"],
+    ["AKIAIOSFODNN7EXAMPLE", "AWS access key id (prefix + long run)"],
+    ["github_pat_abc", "GitHub PAT prefix"],
+    ["ghp_0123456789abcdef", "GitHub token prefix"],
+    ["ya29.a0veryrealtoken", "Google OAuth prefix"],
+    ["deadbeefdeadbeef01", "18-char unbroken token body"],
+  ])("drops short credential-shaped AGENT value %s (%s)", async (value) => {
+    process.env["AGENT"] = value;
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_hint).toBeNull();
+  });
+
+  it("still captures a real multi-segment agent name (no over-rejection)", async () => {
+    process.env["AGENT"] = "gemini_managed_agent";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_hint).toBe("gemini_managed_agent");
+  });
+
+  it("captures TERM_PROGRAM as the editor/terminal hint", async () => {
+    process.env["TERM_PROGRAM"] = "zed";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().term_program).toBe("zed");
+  });
+
+  it("surfaces an unknown agent-ish env KEY in agent_env_hints", async () => {
+    process.env["FOO_AGENT_SESSION_ID"] = "whatever-value";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_env_hints).toContain("FOO_AGENT_SESSION_ID");
+  });
+
+  it("keeps specific markers when infrastructure keys exceed the discovery cap", async () => {
+    for (let i = 0; i < 20; i++) process.env[`AAA_AGENT_${i}_SERVICE_HOST`] = "private-host";
+    process.env["ANTIGRAVITY_AGENT"] = "private-value";
+    process.env["CODEBUDDY_SESSION_ID"] = "private-session";
+    process.env["HARBOR_AGENT"] = "private-harness";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    const hints = detectAgentHints().agent_env_hints ?? "";
+    expect(hints.split(",")).toHaveLength(16);
+    expect(hints).toContain("ANTIGRAVITY_AGENT");
+    expect(hints).toContain("CODEBUDDY_SESSION_ID");
+    expect(hints).toContain("HARBOR_AGENT");
+    expect(hints).not.toContain("private");
+    expect(hints.split(",")).toEqual(hints.split(",").sort());
+  });
+
+  it("excludes generic npm and login-session keys", async () => {
+    process.env["NPM_CONFIG_USER_AGENT"] = "npm/10";
+    process.env["TERM_SESSION_ID"] = "terminal";
+    process.env["XDG_SESSION_ID"] = "login";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_env_hints).toBeNull();
+  });
+
+  it("clears a full 16-key ambient cap so a fixture key still fits", async () => {
+    for (let i = 0; i < 16; i++) process.env[`AAA_AGENT_${String(i).padStart(2, "0")}`] = "1";
+    process.env["FOO_AGENT_SESSION_ID"] = "x";
+    stripVendorEnv();
+    process.env["FOO_AGENT_SESSION_ID"] = "x";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_env_hints).toContain("FOO_AGENT_SESSION_ID");
+  });
+
+  it("excludes SSH/GPG agent false-friends from agent_env_hints", async () => {
+    process.env["SSH_AGENT_PID"] = "12345";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_env_hints ?? "").not.toContain("SSH_AGENT");
+  });
+
+  it("does NOT match ENCODING keys (PYTHONIOENCODING) — no bare CODING token", async () => {
+    process.env["PYTHONIOENCODING"] = "utf-8";
+    const { detectAgentHints } = await import("./agent_runtime.js");
+    expect(detectAgentHints().agent_env_hints ?? "").not.toContain("ENCODING");
   });
 });
 

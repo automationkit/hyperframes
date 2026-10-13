@@ -17,6 +17,8 @@ import {
   STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR,
   STUDIO_ORIGINAL_WIDTH_ATTR,
   STUDIO_ORIGINAL_HEIGHT_ATTR,
+  STUDIO_ORIGINAL_BOX_WIDTH_ATTR,
+  STUDIO_ORIGINAL_BOX_HEIGHT_ATTR,
   STUDIO_ORIGINAL_MIN_WIDTH_ATTR,
   STUDIO_ORIGINAL_MIN_HEIGHT_ATTR,
   STUDIO_ORIGINAL_MAX_WIDTH_ATTR,
@@ -40,15 +42,14 @@ import {
   STUDIO_MOTION_ORIGINAL_VISIBILITY_ATTR,
 } from "./studioMotionTypes";
 import {
-  buildPathOffsetPatches,
   buildClearPathOffsetPatches,
   buildBoxSizePatches,
   buildClearBoxSizePatches,
-  buildRotationPatches,
   buildClearRotationPatches,
   buildMotionPatches,
   buildClearMotionPatches,
 } from "./manualEditsDomPatches";
+import { applyStudioBoxSize } from "./manualEditsDom";
 
 /* ── helpers ── */
 
@@ -69,39 +70,7 @@ function assertClearCoversKeys(buildOps: PatchOperation[], clearOps: PatchOperat
 
 /* ── Path offset ─────────────────────────────────────────────────────────── */
 
-describe("buildPathOffsetPatches / buildClearPathOffsetPatches", () => {
-  function populatedPathEl(): HTMLElement {
-    const e = div();
-    e.style.setProperty(STUDIO_OFFSET_X_PROP, "10px");
-    e.style.setProperty(STUDIO_OFFSET_Y_PROP, "20px");
-    e.style.setProperty("translate", "10px 20px");
-    e.setAttribute(STUDIO_ORIGINAL_TRANSLATE_ATTR, "5px 10px");
-    e.setAttribute(STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR, "3px");
-    e.style.setProperty("display", "flex");
-    e.setAttribute(STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR, "block");
-    return e;
-  }
-
-  it("populated: captures offset styles, attrs, display, and transform-display marker in declaration order", () => {
-    const ops = buildPathOffsetPatches(populatedPathEl());
-    expect(ops).toEqual([
-      { type: "inline-style", property: STUDIO_OFFSET_X_PROP, value: "10px" },
-      { type: "inline-style", property: STUDIO_OFFSET_Y_PROP, value: "20px" },
-      { type: "inline-style", property: "translate", value: "10px 20px" },
-      { type: "attribute", property: STUDIO_PATH_OFFSET_ATTR, value: "true" },
-      { type: "attribute", property: STUDIO_ORIGINAL_TRANSLATE_ATTR, value: "5px 10px" },
-      { type: "attribute", property: STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR, value: "3px" },
-      { type: "inline-style", property: "display", value: "flex" },
-      { type: "attribute", property: STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR, value: "block" },
-    ]);
-  });
-
-  it("empty: bare element yields only the path-offset marker", () => {
-    expect(buildPathOffsetPatches(div())).toEqual([
-      { type: "attribute", property: STUDIO_PATH_OFFSET_ATTR, value: "true" },
-    ]);
-  });
-
+describe("buildClearPathOffsetPatches", () => {
   it("clear: restores translate from STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR and display from STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR", () => {
     const e = div();
     e.setAttribute(STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR, "5px");
@@ -124,11 +93,6 @@ describe("buildPathOffsetPatches / buildClearPathOffsetPatches", () => {
     e.setAttribute(STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR, "");
     const ops = buildClearPathOffsetPatches(e);
     expect(ops.find((o) => o.property === "translate")?.value).toBeNull();
-  });
-
-  it("build/clear symmetry: clear addresses every {type,property} key that build emits", () => {
-    const e = populatedPathEl();
-    assertClearCoversKeys(buildPathOffsetPatches(e), buildClearPathOffsetPatches(e));
   });
 });
 
@@ -221,6 +185,9 @@ describe("buildBoxSizePatches / buildClearBoxSizePatches", () => {
       { type: "attribute", property: STUDIO_ORIGINAL_WIDTH_ATTR, value: null },
       { type: "inline-style", property: "height", value: "150px" },
       { type: "attribute", property: STUDIO_ORIGINAL_HEIGHT_ATTR, value: null },
+      // Measurements, so they are cleared without restoring a style.
+      { type: "attribute", property: STUDIO_ORIGINAL_BOX_WIDTH_ATTR, value: null },
+      { type: "attribute", property: STUDIO_ORIGINAL_BOX_HEIGHT_ATTR, value: null },
       { type: "inline-style", property: "min-width", value: "0px" },
       { type: "attribute", property: STUDIO_ORIGINAL_MIN_WIDTH_ATTR, value: null },
       { type: "inline-style", property: "min-height", value: "0px" },
@@ -256,9 +223,23 @@ describe("buildBoxSizePatches / buildClearBoxSizePatches", () => {
 
   it("clear: bare element emits only null ops — no style restores fire when orig attrs are absent", () => {
     const ops = buildClearBoxSizePatches(div());
-    // 3 fixed (studio-width, studio-height, box-size marker) + 14 attr-null pushes (one per BOX_SIZE_ORIG_ATTR)
-    expect(ops).toHaveLength(17);
+    // 3 fixed (studio-width, studio-height, box-size marker) + 16 attr-null pushes (one per BOX_SIZE_ORIG_ATTR)
+    expect(ops).toHaveLength(19);
     expect(ops.every((op) => op.value === null)).toBe(true);
+  });
+
+  it("backfills the measured box on a legacy element that already has the resize marker", () => {
+    const e = div();
+    e.setAttribute(STUDIO_BOX_SIZE_ATTR, "true");
+    Object.defineProperties(e, {
+      offsetWidth: { configurable: true, value: 630 },
+      offsetHeight: { configurable: true, value: 252 },
+    });
+
+    applyStudioBoxSize(e, { width: 320, height: 128 });
+
+    expect(e.getAttribute(STUDIO_ORIGINAL_BOX_WIDTH_ATTR)).toBe("630");
+    expect(e.getAttribute(STUDIO_ORIGINAL_BOX_HEIGHT_ATTR)).toBe("252");
   });
 
   it("build/clear symmetry: clear addresses every {type,property} key that build emits", () => {
@@ -269,45 +250,7 @@ describe("buildBoxSizePatches / buildClearBoxSizePatches", () => {
 
 /* ── Rotation ────────────────────────────────────────────────────────────── */
 
-describe("buildRotationPatches / buildClearRotationPatches", () => {
-  function populatedRotEl(): HTMLElement {
-    const e = div();
-    e.style.setProperty(STUDIO_ROTATION_PROP, "45");
-    e.style.setProperty("rotate", "45deg");
-    e.style.setProperty("transform-origin", "left center");
-    e.style.setProperty("display", "block");
-    e.setAttribute(STUDIO_ORIGINAL_ROTATE_ATTR, "0deg");
-    e.setAttribute(STUDIO_ORIGINAL_INLINE_ROTATE_ATTR, "0deg");
-    e.setAttribute(STUDIO_ORIGINAL_ROTATION_TRANSFORM_ORIGIN_ATTR, "center center");
-    e.setAttribute(STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR, "flex");
-    return e;
-  }
-
-  it("populated: captures rotation styles, attrs, and transform-display marker in declaration order", () => {
-    const ops = buildRotationPatches(populatedRotEl());
-    expect(ops).toEqual([
-      { type: "inline-style", property: STUDIO_ROTATION_PROP, value: "45" },
-      { type: "inline-style", property: "rotate", value: "45deg" },
-      { type: "inline-style", property: "transform-origin", value: "left center" },
-      { type: "inline-style", property: "display", value: "block" },
-      { type: "attribute", property: STUDIO_ROTATION_ATTR, value: "true" },
-      { type: "attribute", property: STUDIO_ORIGINAL_ROTATE_ATTR, value: "0deg" },
-      { type: "attribute", property: STUDIO_ORIGINAL_INLINE_ROTATE_ATTR, value: "0deg" },
-      {
-        type: "attribute",
-        property: STUDIO_ORIGINAL_ROTATION_TRANSFORM_ORIGIN_ATTR,
-        value: "center center",
-      },
-      { type: "attribute", property: STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR, value: "flex" },
-    ]);
-  });
-
-  it("empty: bare element yields only the rotation marker", () => {
-    expect(buildRotationPatches(div())).toEqual([
-      { type: "attribute", property: STUDIO_ROTATION_ATTR, value: "true" },
-    ]);
-  });
-
+describe("buildClearRotationPatches", () => {
   it("clear: restores rotate and transform-origin from orig attrs, nulls draft attr", () => {
     const e = div();
     e.setAttribute(STUDIO_ORIGINAL_INLINE_ROTATE_ATTR, "30deg");
@@ -338,11 +281,6 @@ describe("buildRotationPatches / buildClearRotationPatches", () => {
     e.setAttribute(STUDIO_ORIGINAL_INLINE_ROTATE_ATTR, "");
     const ops = buildClearRotationPatches(e);
     expect(ops.find((o) => o.property === "rotate")?.value).toBeNull();
-  });
-
-  it("build/clear symmetry: clear addresses every {type,property} key that build emits", () => {
-    const e = populatedRotEl();
-    assertClearCoversKeys(buildRotationPatches(e), buildClearRotationPatches(e));
   });
 });
 

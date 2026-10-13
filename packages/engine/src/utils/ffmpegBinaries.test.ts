@@ -1,6 +1,5 @@
-// fallow-ignore-file code-duplication
 import { resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertConfiguredFfmpegBinariesExist,
   getFfmpegBinary,
@@ -10,12 +9,17 @@ import {
 describe("ffmpeg binary env resolution", () => {
   const originalFfmpegPath = process.env.HYPERFRAMES_FFMPEG_PATH;
   const originalFfprobePath = process.env.HYPERFRAMES_FFPROBE_PATH;
+  const originalPath = process.env.PATH;
 
   afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("child_process");
     if (originalFfmpegPath === undefined) delete process.env.HYPERFRAMES_FFMPEG_PATH;
     else process.env.HYPERFRAMES_FFMPEG_PATH = originalFfmpegPath;
     if (originalFfprobePath === undefined) delete process.env.HYPERFRAMES_FFPROBE_PATH;
     else process.env.HYPERFRAMES_FFPROBE_PATH = originalFfprobePath;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
   });
 
   it("uses configured absolute paths when env vars are set", () => {
@@ -39,5 +43,11 @@ describe("ffmpeg binary env resolution", () => {
     process.env.HYPERFRAMES_FFPROBE_PATH = process.execPath;
 
     expect(() => assertConfiguredFfmpegBinariesExist()).not.toThrow();
+  });
+
+  it("calls out a mangled replacement character in configured binary paths", () => {
+    process.env.HYPERFRAMES_FFMPEG_PATH = "/missing/ffmpeg�.exe";
+
+    expect(() => assertConfiguredFfmpegBinariesExist()).toThrow(/replacement character|mangled/i);
   });
 });

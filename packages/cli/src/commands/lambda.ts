@@ -1,3 +1,4 @@
+import { failCommand } from "../utils/commandResult.js";
 /**
  * `hyperframes lambda` — top-level dispatcher for AWS Lambda subcommands.
  *
@@ -10,13 +11,11 @@
 
 import { defineCommand } from "citty";
 import type { DistributedFormat } from "@hyperframes/aws-lambda/sdk";
-import {
-  type CanvasResolution,
-  VALID_CANVAS_RESOLUTIONS,
-  normalizeResolutionFlag,
-} from "@hyperframes/core";
+import { type CanvasResolution } from "@hyperframes/core";
+import { parseOutputResolutionFlag } from "../utils/parseOutputResolution.js";
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
+import { readAllowedCompositionFpsFromDir } from "../utils/compositionFps.js";
 
 export const examples: Example[] = [
   ["Deploy the Lambda render stack to AWS", "hyperframes lambda deploy"],
@@ -240,7 +239,7 @@ export default defineCommand({
               `Or, for an opt-in dev setup:\n` +
               `  ${c.accent("npm install @hyperframes/aws-lambda")}`,
           );
-          process.exit(1);
+          failCommand();
         }
         throw err;
       }
@@ -265,14 +264,14 @@ export default defineCommand({
           console.error(
             `[lambda sites] unknown verb "${String(args.target)}". Only "create" is supported.`,
           );
-          process.exit(1);
+          failCommand();
         }
         const projectDir = args.extra as string | undefined;
         if (!projectDir) {
           console.error(
             "[lambda sites create] usage: hyperframes lambda sites create <projectDir>",
           );
-          process.exit(1);
+          failCommand();
         }
         const { runSitesCreate } = await import("./lambda/sites.js");
         await runSitesCreate({
@@ -289,20 +288,24 @@ export default defineCommand({
           console.error(
             "[lambda render] usage: hyperframes lambda render <projectDir> --width <px> --height <px>",
           );
-          process.exit(1);
+          failCommand();
         }
         const width = parsePositiveInt(args.width, "--width");
         const height = parsePositiveInt(args.height, "--height");
         if (width === undefined || height === undefined) {
           console.error("[lambda render] --width and --height are required.");
-          process.exit(1);
+          failCommand();
         }
-        const fpsRaw = parseIntFlag(args.fps) ?? 30;
+        const fpsRaw =
+          parseIntFlag(args.fps) ??
+          readAllowedCompositionFpsFromDir(projectDir, [24, 30, 60]) ??
+          30;
         if (fpsRaw !== 24 && fpsRaw !== 30 && fpsRaw !== 60) {
           console.error(`[lambda render] --fps must be 24, 30, or 60; got ${fpsRaw}.`);
-          process.exit(1);
+          failCommand();
         }
         const { runRender } = await import("./lambda/render.js");
+        const renderResolution = parseOutputResolution(args["output-resolution"]);
         await runRender({
           projectDir,
           stackName,
@@ -310,7 +313,8 @@ export default defineCommand({
           fps: fpsRaw,
           width,
           height,
-          outputResolution: parseOutputResolution(args["output-resolution"]),
+          outputResolution: renderResolution.outputResolution,
+          outputResolutionAspectAgnostic: renderResolution.outputResolutionAspectAgnostic,
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
@@ -334,27 +338,31 @@ export default defineCommand({
           console.error(
             "[lambda render-batch] usage: hyperframes lambda render-batch <projectDir> --batch <path.jsonl> --width <px> --height <px>",
           );
-          process.exit(1);
+          failCommand();
         }
         const batch = args.batch as string | undefined;
         if (!batch) {
           console.error(
             "[lambda render-batch] --batch <path.jsonl> is required. Each line is a JSON object with at least { outputKey: '...' }.",
           );
-          process.exit(1);
+          failCommand();
         }
         const width = parsePositiveInt(args.width, "--width");
         const height = parsePositiveInt(args.height, "--height");
         if (width === undefined || height === undefined) {
           console.error("[lambda render-batch] --width and --height are required.");
-          process.exit(1);
+          failCommand();
         }
-        const fpsRaw = parseIntFlag(args.fps) ?? 30;
+        const fpsRaw =
+          parseIntFlag(args.fps) ??
+          readAllowedCompositionFpsFromDir(projectDir, [24, 30, 60]) ??
+          30;
         if (fpsRaw !== 24 && fpsRaw !== 30 && fpsRaw !== 60) {
           console.error(`[lambda render-batch] --fps must be 24, 30, or 60; got ${fpsRaw}.`);
-          process.exit(1);
+          failCommand();
         }
         const { runRenderBatch } = await import("./lambda/render-batch.js");
+        const batchResolution = parseOutputResolution(args["output-resolution"]);
         await runRenderBatch({
           projectDir,
           stackName,
@@ -363,7 +371,8 @@ export default defineCommand({
           fps: fpsRaw,
           width,
           height,
-          outputResolution: parseOutputResolution(args["output-resolution"]),
+          outputResolution: batchResolution.outputResolution,
+          outputResolutionAspectAgnostic: batchResolution.outputResolutionAspectAgnostic,
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
@@ -383,7 +392,7 @@ export default defineCommand({
           console.error(
             "[lambda progress] usage: hyperframes lambda progress <renderId | executionArn>",
           );
-          process.exit(1);
+          failCommand();
         }
         const { runProgress } = await import("./lambda/progress.js");
         await runProgress({ target, stackName, json: Boolean(args.json) });
@@ -400,7 +409,7 @@ export default defineCommand({
           console.error(
             `[lambda policies] usage: hyperframes lambda policies <role|user|validate> [args]`,
           );
-          process.exit(1);
+          failCommand();
         }
         const { runPolicies } = await import("./lambda/policies.js");
         await runPolicies({
@@ -412,7 +421,7 @@ export default defineCommand({
       }
       default:
         console.error(`${c.error("Unknown subcommand:")} ${subcommand}\n${HELP}`);
-        process.exit(1);
+        failCommand();
     }
   },
 });
@@ -474,12 +483,23 @@ const parseQuality = (raw: unknown): (typeof QUALITIES)[number] | undefined =>
 const parseChromeSource = (raw: unknown): (typeof CHROME_SOURCES)[number] =>
   parseEnum(raw, CHROME_SOURCES, "[lambda deploy] --chrome-source", "sparticuz")!;
 
-function parseOutputResolution(raw: unknown): CanvasResolution | undefined {
-  if (raw == null || raw === "") return undefined;
-  const normalized = normalizeResolutionFlag(String(raw));
-  if (normalized) return normalized;
-  throw new Error(
-    `[lambda render] --output-resolution must be one of ${VALID_CANVAS_RESOLUTIONS.join("|")} ` +
-      `(or an alias: 1080p, 4k, uhd, hd, 1080p-portrait, portrait-1080p, 4k-portrait, 1080p-square, square-1080p, 4k-square); got ${String(raw)}`,
-  );
+/**
+ * Lambda flavor of the shared {@link parseOutputResolutionFlag} — same wire
+ * contract as the Cloud Run counterpart. Runtime work lives in the shared
+ * util; wire-config-level coverage lives at `./lambda/render.test.ts` /
+ * `./lambda/render-batch.test.ts`, and full input-space coverage at
+ * `../utils/parseOutputResolution.test.ts`.
+ */
+function parseOutputResolution(raw: unknown): {
+  outputResolution: CanvasResolution | undefined;
+  outputResolutionAspectAgnostic: boolean;
+} {
+  return parseOutputResolutionFlag(raw, {
+    surfaceLabel: "[lambda render]",
+    // The Lambda `--output-resolution` help text advertises the full alias
+    // list (tier-only + orientation-suffixed) — keep the error message
+    // faithful to that surface's docs.
+    aliasHint:
+      "1080p, 4k, uhd, hd, 1080p-portrait, portrait-1080p, 4k-portrait, 1080p-square, square-1080p, 4k-square",
+  });
 }

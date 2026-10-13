@@ -1,7 +1,7 @@
-import { useCallback, type MutableRefObject } from "react";
+import { useCallback } from "react";
 import type { Composition } from "@hyperframes/sdk";
 import type { SlideshowManifest } from "@hyperframes/core/slideshow";
-import type { EditHistoryKind } from "../utils/editHistory";
+import type { PublishSdkSession } from "../utils/sdkCutover";
 import { persistSlideshowManifest } from "../utils/setSlideshowManifest";
 
 export interface UseSlideshowPersistParams {
@@ -11,11 +11,11 @@ export interface UseSlideshowPersistParams {
   writeProjectFile: (path: string, content: string) => Promise<void>;
   recordEdit: (entry: {
     label: string;
-    kind: EditHistoryKind;
     files: Record<string, { before: string; after: string }>;
   }) => Promise<void>;
   reloadPreview: () => void;
-  domEditSaveTimestampRef: MutableRefObject<number>;
+  /** Publish a fully persisted candidate SDK session. */
+  publishSdkSession?: PublishSdkSession;
   /**
    * When provided, rapid writes with the same key coalesce through the
    * save-queue infra (via recordEdit's coalesceKey) so back-to-back persists
@@ -32,7 +32,7 @@ export function useSlideshowPersist({
   writeProjectFile,
   recordEdit,
   reloadPreview,
-  domEditSaveTimestampRef,
+  publishSdkSession,
   coalesceKey,
 }: UseSlideshowPersistParams): (manifest: SlideshowManifest) => Promise<void> {
   return useCallback(
@@ -42,14 +42,14 @@ export function useSlideshowPersist({
       const originalContent = await readProjectFile(path);
       await persistSlideshowManifest({
         manifest,
-        sdkSession,
         originalContent,
         targetPath: path,
         deps: {
           editHistory: { recordEdit },
           writeProjectFile,
           reloadPreview,
-          domEditSaveTimestampRef,
+          readProjectFile,
+          publishSession: publishSdkSession,
         },
         coalesceKey,
       });
@@ -61,7 +61,7 @@ export function useSlideshowPersist({
       writeProjectFile,
       recordEdit,
       reloadPreview,
-      domEditSaveTimestampRef,
+      publishSdkSession,
       coalesceKey,
     ],
   );

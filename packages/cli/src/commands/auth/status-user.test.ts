@@ -1,8 +1,7 @@
-import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeStore } from "../../auth/store.js";
+import { setupTempAuthEnv, type EnvFixture } from "../../auth/_test-utils.js";
+import { consumeCommandResult } from "../../utils/commandResult.js";
 
 // Mock only AuthClient so the live /v3/users/me probe is controllable;
 // keep the real store/resolver/user helpers so the test exercises the
@@ -31,26 +30,16 @@ vi.mock("../../auth/index.js", async (orig) => {
   return { ...actual, AuthClient: MockAuthClient };
 });
 
-const ENV_KEYS = ["HEYGEN_API_KEY", "HYPERFRAMES_API_KEY", "HEYGEN_CONFIG_DIR"] as const;
-
 describe("auth status — persisted user block surface", () => {
-  let dir: string;
-  const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+  let envFixture: EnvFixture;
   let stdout: string[];
 
   beforeEach(async () => {
-    dir = await fs.mkdtemp(join(tmpdir(), "hf-status-"));
-    for (const k of ENV_KEYS) {
-      saved[k] = process.env[k];
-      delete process.env[k];
-    }
-    process.env["HEYGEN_CONFIG_DIR"] = dir;
+    envFixture = await setupTempAuthEnv("hf-status-");
     probeState.apiReject = false;
     probeState.user = { email: "live@example.com" };
     stdout = [];
-    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
-      throw new Error(`process.exit:${code ?? 0}`);
-    }) as never);
+    consumeCommandResult();
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       stdout.push(args.join(" "));
     });
@@ -58,32 +47,33 @@ describe("auth status — persisted user block surface", () => {
   });
 
   afterEach(async () => {
+    consumeCommandResult();
     vi.restoreAllMocks();
-    for (const k of ENV_KEYS) {
-      const v = saved[k];
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    await fs.rm(dir, { recursive: true, force: true });
+    await envFixture.restore();
   });
 
   async function runStatus(asJson: boolean): Promise<number> {
     const cmd = (await import("./status.js")).default;
-    try {
-      await (cmd.run as (ctx: { args: Record<string, unknown> }) => Promise<void>)({
-        args: { json: asJson },
-      });
-      return 0;
-    } catch (err) {
-      const m = /process\.exit:(\d+)/.exec((err as Error).message);
-      if (m) return Number(m[1]);
-      throw err;
-    }
+    await (cmd.run as (ctx: { args: Record<string, unknown> }) => Promise<void>)({
+      args: { json: asJson },
+    });
+    return consumeCommandResult().exitCode;
   }
 
   function lastJson(): Record<string, unknown> {
     return JSON.parse(stdout[stdout.length - 1] ?? "{}");
   }
+
+  it("reports host-managed OAuth without showing its token or a stored identity", async () => {
+    process.env["HEYGEN_ACCESS_TOKEN"] = "fixture-host-secret";
+    await writeStore({ user: { email: "stored@example.com" } });
+    expect(await runStatus(true)).toBe(0);
+    expect(lastJson()).toMatchObject({ source: "env_oauth", persisted_user: null });
+    expect(await runStatus(false)).toBe(0);
+    expect(stdout.join("\n")).toContain("env (HEYGEN_ACCESS_TOKEN)");
+    expect(stdout.join("\n")).not.toContain("fixture-host-secret");
+    expect(stdout.join("\n")).not.toContain("stored@example.com");
+  });
 
   it("surfaces the persisted user block (with resolved display_name) for a file credential", async () => {
     await writeStore({

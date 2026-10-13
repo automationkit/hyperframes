@@ -18,11 +18,13 @@ export interface StudioSaveFailureInput {
 
 export class StudioSaveHttpError extends Error {
   readonly statusCode: number;
+  readonly alreadyToasted: boolean;
 
-  constructor(message: string, statusCode: number) {
+  constructor(message: string, statusCode: number, options: { alreadyToasted?: boolean } = {}) {
     super(message);
     this.name = "StudioSaveHttpError";
     this.statusCode = statusCode;
+    this.alreadyToasted = options.alreadyToasted ?? false;
   }
 }
 
@@ -32,6 +34,32 @@ export class StudioSaveNetworkError extends Error {
     this.name = "StudioSaveNetworkError";
   }
 }
+
+export class StudioFileConflictError extends StudioSaveHttpError {
+  readonly filePath: string;
+  readonly currentVersion: string | null;
+  readonly currentContent: string | null;
+  readonly attemptedContent: string;
+
+  constructor(input: {
+    filePath: string;
+    currentVersion: string | null;
+    currentContent: string | null;
+    attemptedContent: string;
+  }) {
+    super(`Save conflict: ${input.filePath} changed outside this Studio session`, 409);
+    this.name = "StudioFileConflictError";
+    this.filePath = input.filePath;
+    this.currentVersion = input.currentVersion;
+    this.currentContent = input.currentContent;
+    this.attemptedContent = input.attemptedContent;
+  }
+}
+
+export type StudioSaveDrainResult<Failure = unknown> =
+  | { status: "clean" }
+  | { status: "conflict"; error: StudioFileConflictError }
+  | { status: "failed"; error: Failure };
 
 function readNumericProperty(value: object, key: string): number | undefined {
   const record = value as Record<string, unknown>;
@@ -67,6 +95,23 @@ export function getStudioSaveErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error.trim()) return error;
   return "Unknown save failure";
+}
+
+export function markStudioSaveErrorAlreadyToasted<T>(error: T): T {
+  if (!error || typeof error !== "object") return error;
+  try {
+    Object.defineProperty(error, "alreadyToasted", { value: true, configurable: true });
+  } catch {
+    // Best effort: failure reporting must not replace the original save error.
+  }
+  return error;
+}
+
+export function isStudioSaveErrorAlreadyToasted(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if ((error as { alreadyToasted?: unknown }).alreadyToasted === true) return true;
+  const cause = (error as { cause?: unknown }).cause;
+  return cause !== error && isStudioSaveErrorAlreadyToasted(cause);
 }
 
 export function getStudioSaveStatusCode(error: unknown): number | undefined {
@@ -120,16 +165,33 @@ export function buildStudioSaveFailureProperties(
     target_id: input.targetId ?? undefined,
     target_selector: input.targetSelector ?? undefined,
     target_source_file: input.targetSourceFile ?? undefined,
+    block_detail: gsapBlockDetail(input.error),
   };
+}
+
+/**
+ * The specific cause behind a blocked GSAP edit. `error_message` only carries
+ * the coarse copy, and one of those strings covers six different situations,
+ * so the message alone cannot say which one a user hit.
+ */
+function gsapBlockDetail(error: unknown): string | undefined {
+  if (!(error instanceof Error) || error.name !== "GsapEditBlockedError") return undefined;
+  const detail = (error as { detail?: unknown }).detail;
+  return typeof detail === "string" ? detail : undefined;
 }
 
 export function trackStudioSaveFailure(input: StudioSaveFailureInput): void {
   trackStudioEvent("save_failure", buildStudioSaveFailureProperties(input));
 }
 
+export function trackStudioEditBlocked(input: StudioSaveFailureInput): void {
+  trackStudioEvent("edit_blocked", buildStudioSaveFailureProperties(input));
+}
+
 export async function createStudioSaveHttpError(
   response: Response,
   fallbackMessage: string,
+  options: { alreadyToasted?: boolean } = {},
 ): Promise<StudioSaveHttpError> {
   let body = "";
   try {
@@ -141,7 +203,7 @@ export async function createStudioSaveHttpError(
   const message = detail
     ? `${fallbackMessage} (${response.status}): ${detail}`
     : `${fallbackMessage} (${response.status})`;
-  return new StudioSaveHttpError(message, response.status);
+  return new StudioSaveHttpError(message, response.status, options);
 }
 
 export async function retryStudioSave<T>(

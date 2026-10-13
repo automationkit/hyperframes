@@ -21,7 +21,7 @@
 # Unlike the AWS Lambda adapter there is no ZIP-size ceiling and no runtime
 # Chrome decompression step — the binary lives in the image at a fixed path.
 
-FROM node:22-bookworm-slim
+FROM node:22.23.3-bookworm-slim AS beginframe-contract
 
 # ── System dependencies (identical set to the producer's render image) ───────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -55,9 +55,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && fc-cache -fv
 
 # ── chrome-headless-shell (deterministic BeginFrame capture) ─────────────────
-# Pinned to the SAME build the producer regression baselines were generated
-# against so distributed renders are pixel-comparable. Bump together with the
-# producer's Dockerfile.test pin and a baseline regen.
+# Pinned deliberately. The build-stage contract probe below launches this
+# exact executable and requires a renderer-ready warm-up plus a PNG-returning
+# HeadlessExperimental.beginFrame before the image can build.
 RUN npx --yes @puppeteer/browsers install chrome-headless-shell@148.0.7778.167 \
       --path /opt/puppeteer \
     && CHS="$(find /opt/puppeteer/chrome-headless-shell -name chrome-headless-shell -type f | head -n1)" \
@@ -78,7 +78,7 @@ WORKDIR /app
 # the container runs `bun dist/server.js` and relies on bun's ESM `require`
 # interop to load the producer bundle, so a future bun release changing that
 # behaviour shouldn't silently break the next image rebuild. Bump deliberately.
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.9"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
 ENV PATH="/root/.bun/bin:$PATH"
 
 # Install workspace dependencies. Copy manifests first for layer caching.
@@ -92,18 +92,68 @@ COPY packages/studio/package.json packages/studio/package.json
 COPY packages/shader-transitions/package.json packages/shader-transitions/package.json
 COPY packages/aws-lambda/package.json packages/aws-lambda/package.json
 COPY packages/gcp-cloud-run/package.json packages/gcp-cloud-run/package.json
-RUN bun install --frozen-lockfile
+COPY packages/lint/package.json packages/lint/package.json
+COPY packages/parsers/package.json packages/parsers/package.json
+COPY packages/sdk/package.json packages/sdk/package.json
+COPY packages/sdk-playground/package.json packages/sdk-playground/package.json
+COPY packages/inspector/package.json packages/inspector/package.json
+COPY packages/studio-server/package.json packages/studio-server/package.json
+COPY scripts/package-subpaths.mjs scripts/package-subpaths.mjs
+# A corrupt tarball extraction can print an error and then hang instead of
+# exiting (seen in Dockerfile.test, run 35468046055). Bound each attempt and
+# retry once, so a prod deploy build fails fast instead of hanging.
+RUN timeout 300 bun install --frozen-lockfile \
+    || timeout 300 bun install --frozen-lockfile
+
+# Fail the image build closed if the packaged executable cannot perform the
+# same BeginFrame operation the distributed renderer relies on. Generate the
+# argument list with the production engine helper so a launcher-flag regression
+# invalidates this layer and fails the contract instead of testing a duplicate
+# hard-coded profile.
+COPY packages/parsers/ packages/parsers/
+COPY packages/engine/ packages/engine/
+COPY packages/aws-lambda/scripts/probe-beginframe.ts packages/aws-lambda/scripts/probe-beginframe.ts
+RUN bun -e 'import { buildChromeArgs } from "./packages/engine/src/services/browserManager.ts"; await Bun.write("/tmp/hf-gcp-chrome-args.json", JSON.stringify(buildChromeArgs({ width: 800, height: 600, captureMode: "beginframe", platform: "linux" }, { browserGpuMode: "software" })))' \
+    && bun packages/aws-lambda/scripts/probe-beginframe.ts \
+      --executable-path /opt/chrome/chrome-headless-shell \
+      --launch-args-json /tmp/hf-gcp-chrome-args.json
+
+# Reports whether this exact pinned binary gets a hardware WebGPU adapter. A software-only
+# host reports "no usable adapter" without failing the build; its WebGPU compositions refuse
+# to render at run time. A real script file, not an inline `bun -e` eval: the eval's
+# synthetic `/app/[eval]` path can't resolve the workspace-hoisted `puppeteer-core`.
+COPY packages/aws-lambda/scripts/probe-webgpu-adapter.ts packages/aws-lambda/scripts/probe-webgpu-adapter.ts
+RUN bun packages/aws-lambda/scripts/probe-webgpu-adapter.ts \
+      --executable-path /opt/chrome/chrome-headless-shell
+
+# CI targets `beginframe-contract` directly, so pin/probe changes do not need
+# the full monorepo build merely to verify browser capability. The deployable
+# image continues from the already-proven binary and installed workspaces.
+FROM beginframe-contract AS runtime
 
 # Copy source for the packages the render path needs.
 COPY packages/core/ packages/core/
 COPY packages/engine/ packages/engine/
 COPY packages/producer/ packages/producer/
 COPY packages/gcp-cloud-run/ packages/gcp-cloud-run/
+COPY packages/lint/ packages/lint/
+COPY packages/parsers/ packages/parsers/
+COPY packages/sdk/ packages/sdk/
+COPY packages/sdk-playground/ packages/sdk-playground/
+COPY packages/studio-server/ packages/studio-server/
 
-# Build core runtime artifacts (needed by the renderer) + producer, then the
-# adapter. Generate embedded font data so glyph layout matches production.
-RUN bun run --filter @hyperframes/core build:hyperframes-runtime:modular \
-    && (cd packages/producer && bunx tsx scripts/generate-font-data.ts) \
+# Build workspace dependencies before the producer bundle. The published
+# workspace packages are not prebuilt in a fresh clone, so producer's esbuild
+# resolution otherwise fails on parsers/core compiler entrypoints. Core's build
+# also generates the embedded font data, so glyph layout matches production.
+RUN bun run --cwd packages/parsers build \
+    && bun run --cwd packages/lint build \
+    && bun run --cwd packages/studio-server build \
+    && bun run --cwd packages/core build \
+    && bun run --cwd packages/core build:hyperframes-runtime:modular \
+    && bun run --cwd packages/sdk build \
+    && bun run --cwd packages/sdk-playground build \
+    && bun run --cwd packages/engine build \
     && bun run --cwd packages/producer build \
     && bun run --cwd packages/gcp-cloud-run build
 

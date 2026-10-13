@@ -1,6 +1,6 @@
 # Visual design — PR-to-video per-frame shot method
 
-> The method behind **Step 4 (Frame visual design)**. You (the orchestrator) read it to **enrich `STORYBOARD.md` frames in place** — story-design wrote the skeleton (each frame's `scene`, `voiceover`, `transition_in`, the narrative fields, and optionally a candidate blueprint id); you add how each frame **looks and moves**. The unit you write per frame is a **time-coded shot sequence** — a shot directed across its whole duration, not a static slide. You write **no HTML** (that's the frame workers). A PR video is **mostly invented** — typography, number-lockups, mechanism diagrams — so you **design** those elements; the two exceptions are **code beats** (a ready-made `code-*` registry block) and the **credits close** (real contributor avatars), both covered below. `frame.md` is your palette/type truth by role. Layout is a compact vocabulary in this file (the **Layout** section below), stated inline per Scene; motion vocabulary + the motion doctrine + the seek-safe core → `motion-language.md`; the proven shapes → `../hyperframes-animation/blueprints-index.md` + `blueprints/<id>.md`; the `code-*` blocks → `code-vocabulary.md`; concrete rules resolve in Step 5 from this skill's local `../hyperframes-animation/rules/`. Adding palette theory or a generic font rule here? Wrong home — `frame.md` + `hyperframes-creative`.
+> The method behind **Step 4 (Frame visual design)**. You (the orchestrator) read it to **enrich `STORYBOARD.md` frames in place** — story-design wrote the skeleton (each frame's `scene`, `voiceover`, `transition_in`, the narrative fields, and optionally a candidate blueprint id); you add how each frame **looks and moves**. The unit you write per frame is a **time-coded shot sequence** — a shot directed across its whole duration, not a static slide. You write **no HTML** (that's the frame workers). A PR video is **mostly invented** — typography, number-lockups, mechanism diagrams — so you **design** those elements; the two exceptions are **code beats** (a ready-made `code-*` registry block) and the **credits close** (real contributor avatars), both covered below. `frame.md` is your palette/type truth by role. Layout is a compact vocabulary in this file (the **Layout** section below), stated inline per Scene; motion vocabulary + the motion doctrine + the seek-safe core → `motion-language.md`; the proven shapes → `../../hyperframes-animation/blueprints-index.md` + `blueprints/<id>.md`; the `code-*` blocks → `code-vocabulary.md`; concrete rules resolve in Step 5 from this skill's local `../../hyperframes-animation/rules/`. Adding palette theory or a generic font rule here? Wrong home — `frame.md` + `hyperframes-creative`.
 
 ## The unit is a time-coded shot sequence
 
@@ -24,7 +24,7 @@ Scene N (…–end):   content has resolved; hold the read (stillness; subtle ji
 
 Don't invent each shot from scratch. The frame's **role** (its `type` / `beat`) points to a proven shape:
 
-1. **Match the role to a blueprint.** Open `../hyperframes-animation/blueprints-index.md`, find the frame's role in the **role→blueprint menu**, and pick the blueprint whose intent fits this beat (story may already have named a candidate id — confirm or override it). Read that `blueprints/<id>.md`: it is a short, domain-agnostic, **time-coded shot template with `[slots]`** and a named **signature move**.
+1. **Match the role to a blueprint.** Open `../../hyperframes-animation/blueprints-index.md`, find the frame's role in the **role→blueprint menu**, and pick the blueprint whose intent fits this beat (story may already have named a candidate id — confirm or override it). Read that `blueprints/<id>.md`: it is a short, domain-agnostic, **time-coded shot template with `[slots]`** and a named **signature move**.
 
 2. **Instantiate its `[slots]` with THIS frame's content** — three postures:
    - **Reproduce** — the blueprint fits the beat and your content maps onto its slots cleanly. Fill every `[slot]` and follow its Scene timing.
@@ -71,21 +71,21 @@ The lightweight tags:
 For a `diff` / `before_after` / code beat, the frame's centerpiece is a **ready-made `code-*` registry block**, not an invented HTML visual — the one exception to "invent every visual."
 
 - **Name the block in `scene` + `focal`.** Pick the one that fits the beat (before→after = `code-diff`; refactor/rename = `code-morph`; new code written on = `code-typing`; spotlight a line = `code-highlight`; walk a long file = `code-scroll`; a hero reveal = `code-3d-extrude` / `code-particle-assemble`). Full map → `code-vocabulary.md`. Name the hunk too ("the `request()` retry block, ~6 lines"). The block is the `focal`; the Step-5 worker installs + fills it with the real diff.
-- **The block owns the code animation; your Scenes choreograph the surrounding Code Surface.** The block _is_ the development beat (the diff/typewriter/morph plays on its own cadence — the worker only fits it to the frame's `data-duration` so a long snippet doesn't overrun). Your Scene windows move the claude **Code Surface** around it: the navy window seating in, the file header typing on, the camera settling onto the hunk, a `+N/−M` `count-up`, a coral underline drawing on the landed line. Name those moves inline; **do not re-specify the code animation itself.** A code beat is usually `blueprint: compose` (the block is the shape).
+- **The block owns the code animation; your Scenes choreograph the surrounding Code Surface.** The block _is_ the development beat (the diff/typewriter/morph plays on its own cadence — the worker only fits it to the frame's `data-duration` so a long snippet doesn't overrun). Your Scene windows move the code-editorial **Code Surface** around it: the navy window seating in, the file header typing on, the camera settling onto the hunk, a `+N/−M` `count-up`, a coral underline drawing on the landed line. Name those moves inline; **do not re-specify the code animation itself.** A code beat is usually `blueprint: compose` (the block is the shape).
 
 ## PR mechanism beats — invent an animated diagram of the behavior
 
 A **`mechanism`** frame is the **show-the-behavior** beat — the antidote to a video that only shows code + text. Its `focal` is an **invented animated diagram** that plays out what the change _does_ at runtime (the request retrying, the cache filling, serial→parallel, the race resolved) — **not** a `code-*` block and **not** a headline.
 
-- **Name the behavior + the diagram in `scene` + `focal`.** e.g. `scene: "animate the request lifecycle — fire → 500 → backoff → retry → 200, invented SVG flow"`; `focal: the request-lifecycle flow`. Reach for the `flowchart` / `flowchart-vertical` / `data-chart` registry blocks where they fit (name them in `scene` so Step 5 pre-installs them); otherwise the worker builds it in SVG / HTML / GSAP from claude's atoms.
+- **Name the behavior + the diagram in `scene` + `focal`.** e.g. `scene: "animate the request lifecycle — fire → 500 → backoff → retry → 200, invented SVG flow"`; `focal: the request-lifecycle flow`. Reach for the `flowchart` / `flowchart-vertical` / `data-chart` registry blocks where they fit (name them in `scene` so Step 5 pre-installs them); otherwise the worker builds it in SVG / HTML / GSAP from code-editorial's atoms.
 - **The build IS the shot sequence.** Unlike a code block (which owns its own animation), the diagram is yours to choreograph across the Scene windows — the lanes / nodes draw on (Scene 1), the flow runs / the lane splits / the front advances as the VO names each step (middle Scenes), the resolved state + one coral emphasis lands (final Scene). Never let it enter then freeze.
-- **Stay on claude's cream ground, hairline-ink.** Nodes / edges / lanes in hairline ink on cream; **one coral marker** on the active or changed element; mono labels. Not the navy code surface (that's for code), not heavy shapes / bokeh. Plan it into the top ~83% (caption keep-out).
+- **Stay on code-editorial's cream ground, hairline-ink.** Nodes / edges / lanes in hairline ink on cream; **one coral marker** on the active or changed element; mono labels. Not the navy code surface (that's for code), not heavy shapes / bokeh. Plan it into the top ~83% (caption keep-out).
 
 A `mechanism` frame carries **no** `asset_candidates` (it's invented, like every non-credits frame).
 
 ## Impact & credits
 
-- **Impact / evidence** — numbers (`+1,204 / −318`, files touched, perf delta) go on an `impact` frame as a **`number-lockup`** (claude's Number/Impact treatment): name it the `focal`, reveal it with a `count-up` paced to the VO.
+- **Impact / evidence** — numbers (`+1,204 / −318`, files touched, perf delta) go on an `impact` frame as a **`number-lockup`** (code-editorial's Number/Impact treatment): name it the `focal`, reveal it with a `count-up` paced to the VO.
 - **Credits close** — the optional `credits` frame uses the real `assets/<login>.png` avatars (named in story's `asset_candidates`) as the `focal`: an avatar row that staggers in. This is the one frame with non-empty `asset_candidates` and real assets.
 
 ## Inventing the visual (non-code beats)
@@ -120,7 +120,7 @@ The zones, density, hierarchy, and depth principles all still apply; the **aspec
 
 The whole video shares one look and one motion grammar. Write a **`## Video direction`** block ONCE at the top of `STORYBOARD.md` so every frame inherits it and per-frame Scene lines carry only the **delta**. This block is load-bearing — **keep it.**
 
-- **palette system** — from `frame.md` (claude): which roles map to which hues. Never invent.
+- **palette system** — from `frame.md` (code-editorial): which roles map to which hues. Never invent.
 - **motion grammar + reveal model** — long-tail eases (`power3` default, smooth over bouncy) + the **VO-paced reveal** model + what may stay alive during a hold (subtle jitter at most) (→ `motion-language.md`).
 - **rhythm / held-frame allocation** — name the **held / breather frames** so the video varies its energy.
 - **negative list** — off-brand textures, **plus both motion failure modes** — slideshow (front-load then freeze) and screensaver (everything floating independently) (→ `motion-language.md`).
@@ -129,7 +129,7 @@ Do **not** repeat these per frame.
 
 ## Palette & type — from `frame.md`, never invented
 
-- **Palette** — `frame.md` (claude) is the color truth; apply its roles per frame. Generic basics → `hyperframes-creative/references/house-style.md`.
+- **Palette** — `frame.md` (code-editorial) is the color truth; apply its roles per frame. Generic basics → `hyperframes-creative/references/house-style.md`.
 - **Type** — fonts resolve via `frame.md`'s type tokens; reference them **by role** (display / body / mono / the pack's ramp), never by raw family or px. Code surfaces and mechanism labels use the **mono** role. Typography craft → `hyperframes-creative/references/typography.md`.
 
 ## Caption-band keep-out (plan side)
@@ -138,16 +138,16 @@ The bottom ~17% of the canvas is reserved for the caption pill. Plan every frame
 
 ## Where the detail lives
 
-| For…                                                                            | Read                                                                           |
-| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| the proven shapes + role→blueprint menu + how to pick                           | `../hyperframes-animation/blueprints-index.md` → `blueprints/<id>.md`          |
-| the `code-*` blocks (pick + fill for a code beat)                               | `code-vocabulary.md` (local)                                                   |
-| motion — shot model, vocabulary, holds, idle budget, stillness, seek-safe       | `motion-language.md` (local)                                                   |
-| layout — framing, density, depth, hierarchy, inventing the visual, caption band | the **Layout** + **Inventing the visual** sections in this file                |
-| concrete eases / ms / stagger + rule recipe bodies (Step 5)                     | local `../hyperframes-animation/rules/` (the frame worker reads it; you don't) |
-| palette + type tokens                                                           | the project's `frame.md` (claude); basics → `hyperframes-creative`             |
-| within-frame cuts / seams (zoom-through · cut-the-curve · waterfall)            | `cut-catalog.md` (the worker builds them inside the composition)               |
-| transitions                                                                     | story-design owns `transition_in`; you don't touch it                          |
+| For…                                                                            | Read                                                                              |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| the proven shapes + role→blueprint menu + how to pick                           | `../../hyperframes-animation/blueprints-index.md` → `blueprints/<id>.md`          |
+| the `code-*` blocks (pick + fill for a code beat)                               | `code-vocabulary.md` (local)                                                      |
+| motion — shot model, vocabulary, holds, idle budget, stillness, seek-safe       | `motion-language.md` (local)                                                      |
+| layout — framing, density, depth, hierarchy, inventing the visual, caption band | the **Layout** + **Inventing the visual** sections in this file                   |
+| concrete eases / ms / stagger + rule recipe bodies (Step 5)                     | local `../../hyperframes-animation/rules/` (the frame worker reads it; you don't) |
+| palette + type tokens                                                           | the project's `frame.md` (code-editorial); basics → `hyperframes-creative`        |
+| within-frame cuts / seams (zoom-through · cut-the-curve · waterfall)            | `cut-catalog.md` (the worker builds them inside the composition)                  |
+| transitions                                                                     | story-design owns `transition_in`; you don't touch it                             |
 
 ## Before you finish — checklist
 
@@ -156,7 +156,7 @@ The bottom ~17% of the canvas is reserved for the caption pill. Plan every frame
 - **No frame front-loads** — at t=0 only what the VO is saying enters; each further piece reveals on its spoken cue, across the back ~50%. Window count follows the VO.
 - Every frame names a **`blueprint:`** id (Reproduce / Adapt) or `compose`; an Adapt keeps the signature move; nothing collapses to a single front-loaded dump.
 - **Code beats** name a `code-*` block as the `focal`, let the block own the code animation, and choreograph only the surrounding Code Surface in the Scenes.
-- **Mechanism beats** name an **invented animated diagram of the behavior** (or a `flowchart` / `data-chart`), choreographed across the Scenes on claude's cream ground with one coral marker — not a code block, not typography; the body is not an unbroken run of code surfaces.
+- **Mechanism beats** name an **invented animated diagram of the behavior** (or a `flowchart` / `data-chart`), choreographed across the Scenes on code-editorial's cream ground with one coral marker — not a code block, not typography; the body is not an unbroken run of code surfaces.
 - **Impact** uses a `number-lockup` with a `count-up`; the **credits** close uses the real avatars as the `focal`.
 - Each non-code, non-credits frame names its **invented** `focal` + per-element `roles`, kept few and load-bearing.
 - Layout + motion named **inline** per Scene (no px / ease curves / ms / JS).

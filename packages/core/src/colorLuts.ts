@@ -30,7 +30,7 @@ export class CubeLutParseError extends Error {
 
 const DEFAULT_DOMAIN_MIN: CubeLutVec3 = [0, 0, 0];
 const DEFAULT_DOMAIN_MAX: CubeLutVec3 = [1, 1, 1];
-const DEFAULT_MAX_SIZE = 64;
+export const DEFAULT_MAX_CUBE_LUT_SIZE = 64;
 
 function stripComment(line: string): string {
   let inQuote = false;
@@ -93,7 +93,7 @@ function isNumericDataLine(token: string): boolean {
 
 // fallow-ignore-next-line complexity
 export function parseCubeLut(input: string, options: ParseCubeLutOptions = {}): CubeLut3D {
-  const maxSize = options.maxSize ?? DEFAULT_MAX_SIZE;
+  const maxSize = options.maxSize ?? DEFAULT_MAX_CUBE_LUT_SIZE;
   let title: string | null = null;
   let domainMin: CubeLutVec3 = DEFAULT_DOMAIN_MIN;
   let domainMax: CubeLutVec3 = DEFAULT_DOMAIN_MAX;
@@ -120,6 +120,19 @@ export function parseCubeLut(input: string, options: ParseCubeLutOptions = {}): 
     }
     if (keyword === "DOMAIN_MAX") {
       domainMax = parseVec3(rest, keyword, lineNumber);
+      continue;
+    }
+    if (keyword === "LUT_3D_INPUT_RANGE") {
+      if (rest.length !== 2) {
+        throw new CubeLutParseError(`${keyword} expects two numbers`, lineNumber);
+      }
+      const min = parseFiniteNumber(rest[0]!, lineNumber);
+      const max = parseFiniteNumber(rest[1]!, lineNumber);
+      if (max <= min) {
+        throw new CubeLutParseError("LUT_3D_INPUT_RANGE max must exceed min", lineNumber);
+      }
+      domainMin = [min, min, min];
+      domainMax = [max, max, max];
       continue;
     }
     if (keyword === "LUT_1D_SIZE") {
@@ -186,7 +199,7 @@ function clampUnit(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
-function toByte(value: number): number {
+export function unitFloatToByte(value: number): number {
   return Math.round(clampUnit(value) * 255);
 }
 
@@ -201,9 +214,9 @@ export function packCubeLutToRgba8(lut: CubeLut3D): PackedCubeLut2D {
       for (let r = 0; r < size; r++) {
         const lutIndex = ((b * size + g) * size + r) * 3;
         const pixelIndex = (g * width + b * size + r) * 4;
-        packed[pixelIndex] = toByte(lut.data[lutIndex] ?? 0);
-        packed[pixelIndex + 1] = toByte(lut.data[lutIndex + 1] ?? 0);
-        packed[pixelIndex + 2] = toByte(lut.data[lutIndex + 2] ?? 0);
+        packed[pixelIndex] = unitFloatToByte(lut.data[lutIndex] ?? 0);
+        packed[pixelIndex + 1] = unitFloatToByte(lut.data[lutIndex + 1] ?? 0);
+        packed[pixelIndex + 2] = unitFloatToByte(lut.data[lutIndex + 2] ?? 0);
         packed[pixelIndex + 3] = 255;
       }
     }

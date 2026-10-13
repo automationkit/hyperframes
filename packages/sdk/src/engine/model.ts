@@ -5,8 +5,14 @@
  * go here. serialize() walks the live DOM; no separate mutable tree to sync.
  */
 
-import { parseHTML } from "linkedom";
-import { ensureHfIds } from "@hyperframes/core/hf-ids";
+import { isFullHtmlDocument, parseHTMLContent } from "@hyperframes/core/compiler/html-document";
+import { findTimelineScript } from "@hyperframes/core/gsap-parser-acorn";
+import { findVariableDeclaration } from "./variableModel.js";
+import {
+  ensureHfIds,
+  isCompositionTemplate,
+  walkCompositionDescendants,
+} from "@hyperframes/core/hf-ids";
 
 export interface ParsedDocument {
   document: Document;
@@ -18,12 +24,9 @@ export interface ParsedDocument {
 
 export function parseMutable(html: string): ParsedDocument {
   const stamped = ensureHfIds(html);
-  const hasShell = /<!doctype|<html[\s>]/i.test(stamped);
-  const wrapped = !hasShell;
-  const { document } = wrapped
-    ? parseHTML(`<!DOCTYPE html><html><head></head><body>${stamped}</body></html>`)
-    : parseHTML(stamped);
-  return { document: document as unknown as Document, wrapped, stamped };
+  const wrapped = !isFullHtmlDocument(stamped);
+  const document = parseHTMLContent(stamped);
+  return { document, wrapped, stamped };
 }
 
 // ─── Element lookup ───────────────────────────────────────────────────────────
@@ -39,6 +42,42 @@ export function findById(document: Document, id: string): Element | null {
 
 export function escapeHfId(id: string): string {
   return id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
+ * querySelectorAll that also descends into COMPOSITION `<template>` subtrees
+ * (`data-composition-id` — the pattern the studio preview unwraps) — linkedom's
+ * querySelectorAll does not, so template-based sub-comp content would be
+ * unreachable for resolution/dispatch even though buildRoots models it.
+ *
+ * Implemented as a document-order DOM walk (not qsa + append) so duplicate-id
+ * tiebreaks resolve in TRUE document order — appending template matches after
+ * all top-level matches would make resolveScoped pick a different duplicate
+ * than the preview's unwrapped DOM does. Plain templates (runtime clone
+ * sources) are skipped, matching buildChildren and ensureHfIds.
+ *
+ * Throws like querySelectorAll on an invalid selector (Element.matches).
+ */
+export function querySelectorAllDeep(root: Document | Element, selector: string): Element[] {
+  const out: Element[] = [];
+  const start: Element | null =
+    "body" in root ? ((root as Document).body ?? null) : (root as Element);
+  const walk = (parent: Element): void => {
+    for (const child of Array.from(parent.children)) {
+      if (child.tagName.toLowerCase() === "template") {
+        if (isCompositionTemplate(child)) walk(child);
+        continue;
+      }
+      if (child.matches(selector)) out.push(child);
+      walk(child);
+    }
+  };
+  if (start) {
+    // When rooted at an Element (scoped-path step), the root itself is the
+    // context, not a candidate — only descendants match, like querySelectorAll.
+    walk(start);
+  }
+  return out;
 }
 
 /**
@@ -75,7 +114,7 @@ export function resolveScoped(document: Document, id: string): Element | null {
   // resolution agrees with getElement (scopedId === id wins over document order).
   if (parts.length === 1) {
     const escaped = escapeHfId(id);
-    const matches = Array.from(document.querySelectorAll(`[data-hf-id="${escaped}"]`));
+    const matches = querySelectorAllDeep(document, `[data-hf-id="${escaped}"]`);
     if (matches.length > 0) {
       return matches.find((el) => isCanonicalScope(el)) ?? matches[0] ?? null;
     }
@@ -84,20 +123,32 @@ export function resolveScoped(document: Document, id: string): Element | null {
     // (the id studio passes when targeting the sub-comp root). data-hf-id takes
     // precedence above; only when no hf-id matches do we treat the bare id as a
     // composition id, making comp-ids first-class resolvable addresses.
-    return document.querySelector(`[data-composition-id="${escaped}"]`);
+    return querySelectorAllDeep(document, `[data-composition-id="${escaped}"]`)[0] ?? null;
   }
 
   let context: Element | Document = document;
   for (const part of parts) {
     const escaped = escapeHfId(part);
     const found: Element | null =
-      context === document
-        ? (context as Document).querySelector(`[data-hf-id="${escaped}"]`)
-        : (context as Element).querySelector(`[data-hf-id="${escaped}"]`);
+      querySelectorAllDeep(context, `[data-hf-id="${escaped}"]`)[0] ?? null;
     if (!found) return null;
     context = found;
   }
   return context as Element;
+}
+
+/**
+ * Bare leaf id from a scoped hf-id ("hf-HOST/hf-LEAF" → "hf-LEAF"; a bare id
+ * passes through unchanged). The live DOM's `data-hf-id` attribute never
+ * carries the host-chain prefix, so a consumer holding a scopedId (from
+ * getElements()/getElement()) needs this to query the rendered DOM directly.
+ */
+export function bareId(scopedId: string): string {
+  const parts = scopedId.split("/");
+  // split() always returns >=1 element, so this never actually falls through at
+  // runtime — the fallback exists to satisfy noUncheckedIndexedAccess, not as a
+  // reachable safety net.
+  return parts[parts.length - 1] ?? scopedId;
 }
 
 /**
@@ -116,10 +167,50 @@ export function isNewHostBoundary(el: Element): boolean {
   return dcf !== parentDcf;
 }
 
+/**
+ * The elements carrying `data-composition-variables`, in the runtime's merge
+ * order: `<html>`, then the composition root, whose entries win a shared id. A
+ * wrapped template/fragment comp has a synthetic `<html>` that serialize()
+ * strips, so only its root counts.
+ */
+export function declarationCarriers(document: Document, wrapped: boolean): Element[] {
+  const root = findRoot(document);
+  const html = wrapped
+    ? null
+    : (document as Document & { documentElement?: Element }).documentElement;
+  const carriers = [html, root].filter(
+    (el): el is Element => !!el?.hasAttribute("data-composition-variables"),
+  );
+  return [...new Set(carriers)];
+}
+
+/**
+ * Where a declaration op lands: the carrier that declares `id` (the root first,
+ * as it wins), else the root if it carries declarations, else `<html>` (the
+ * root div for wrapped comps).
+ */
+export function declarationElement(
+  document: Document,
+  wrapped: boolean,
+  id?: string,
+): Element | null {
+  const winnerFirst = declarationCarriers(document, wrapped).reverse();
+  const owner =
+    id === undefined ? undefined : winnerFirst.find((el) => findVariableDeclaration(el, id));
+  if (owner) return owner;
+  if (wrapped) return findRoot(document);
+  return (
+    winnerFirst[0] ?? (document as Document & { documentElement?: Element }).documentElement ?? null
+  );
+}
+
 export function findRoot(document: Document): Element | null {
   return (
     document.querySelector("[data-hf-root]") ??
     document.getElementById("stage") ??
+    // Descend into a composition <template> so a wrapped template sub-comp
+    // resolves to its inner [data-composition-id] root, not the <template> shell.
+    querySelectorAllDeep(document, "[data-composition-id]")[0] ??
     document.body?.firstElementChild ??
     null
   );
@@ -145,11 +236,11 @@ interface StyleDeclarationScan {
 }
 
 function advanceStyleDeclarationScan(scan: StyleDeclarationScan, ch: string, next: string): void {
+  if (ch === "\\" && next) {
+    scan.skip = true;
+    return;
+  }
   if (scan.quote) {
-    if (ch === "\\" && next) {
-      scan.skip = true;
-      return;
-    }
     if (ch === scan.quote) scan.quote = null;
     return;
   }
@@ -235,18 +326,55 @@ function isHTMLElementTarget(el: Element): boolean {
   return "style" in el;
 }
 
-function resolveSingleChildTextTarget(el: Element): Element | null {
-  const inner = el.children.length === 1 ? el.firstElementChild : null;
-  return inner && isHTMLElementTarget(inner) ? inner : null;
+// Void elements can't hold text, so a lone `<br>`/`<img>`/`<hr>`/… child is
+// never the element's text target. Treating one as such made getOwnText read
+// "" (→ `text: null`, surfaced as "not editable") and setOwnText write into the
+// void element, corrupting it — e.g. a `<br>` gained a text child and
+// serialized as invalid `</br>`.
+const VOID_TEXT_TARGET_TAGS = new Set([
+  "AREA",
+  "BASE",
+  "BR",
+  "COL",
+  "EMBED",
+  "HR",
+  "IMG",
+  "INPUT",
+  "LINK",
+  "META",
+  "PARAM",
+  "SOURCE",
+  "TRACK",
+  "WBR",
+]);
+
+function isBrElement(node: Node): boolean {
+  return node.nodeType === 1 && (node as Element).tagName === "BR";
 }
 
-/** Read the text target used by SDK setText. */
+/** A flat text leaf: no element children, or only `<br>` line breaks
+ *  (e.g. `<h1>First<br>Second</h1>`). Such an element's entire content is its
+ *  own text, so setText owns it end-to-end. Vacuously true for zero children. */
+function isTextOrBrLeaf(el: Element): boolean {
+  return Array.from(el.children).every((child) => child.tagName === "BR");
+}
+
+function resolveSingleChildTextTarget(el: Element): Element | null {
+  const inner = el.children.length === 1 ? el.firstElementChild : null;
+  if (!inner || !isHTMLElementTarget(inner)) return null;
+  if (VOID_TEXT_TARGET_TAGS.has(inner.tagName)) return null;
+  return inner;
+}
+
+/** Read the text target used by SDK setText. `<br>` line breaks are surfaced as
+ *  "\n" so a multi-line leaf round-trips through setOwnText. */
 export function getOwnText(el: Element): string {
   const singleChild = resolveSingleChildTextTarget(el);
   if (singleChild) return singleChild.textContent ?? "";
   let text = "";
   el.childNodes.forEach((n) => {
     if (n.nodeType === 3) text += (n as Text).nodeValue ?? "";
+    else if (isBrElement(n)) text += "\n";
   });
   return text;
 }
@@ -260,6 +388,23 @@ export function setOwnText(el: Element, text: string): void {
   }
 
   const doc = el.ownerDocument;
+
+  // Flat text leaf (text and/or `<br>` only): rebuild the text/`<br>` run from
+  // the "\n"-separated value — the inverse of getOwnText. Existing `<br>` nodes
+  // are reused in order so their identity (data-hf-id, etc.) survives an edit
+  // that keeps the line, and a new one is only minted when a line is added.
+  // Never writes text into a `<br>`, so no `</br>` corruption.
+  if (isTextOrBrLeaf(el)) {
+    const spareBrs = Array.from(el.children).filter((child) => child.tagName === "BR");
+    while (el.firstChild) el.removeChild(el.firstChild);
+    const lines = text.split("\n");
+    lines.forEach((line, index) => {
+      if (index > 0) el.appendChild(spareBrs.shift() ?? doc.createElement("br"));
+      if (line) el.appendChild(doc.createTextNode(line));
+    });
+    return;
+  }
+
   const children = Array.from(el.childNodes);
   // Track original position of the first text node so we restore there, not at firstChild.
   let firstTextIdx = -1;
@@ -309,14 +454,31 @@ export function setStyleSheet(document: Document, css: string): void {
 
 // ─── GSAP script helpers ──────────────────────────────────────────────────────
 
-function findGsapScriptElement(document: Document): Element | null {
-  const scripts = document.querySelectorAll("script");
-  for (const script of Array.from(scripts)) {
-    const text = script.textContent ?? "";
-    if (text.includes("gsap") || text.includes("ScrollTrigger"))
-      return script as unknown as Element;
-  }
-  return null;
+function findScriptElementsDeep(document: Document): Element[] {
+  const scripts: Element[] = [];
+  walkCompositionDescendants(document, (child) => {
+    if (child.tagName.toLowerCase() === "script") scripts.push(child);
+  });
+  return scripts;
+}
+
+function isGsapScriptText(text: string): boolean {
+  return text.includes("gsap") || text.includes("__timelines") || text.includes("ScrollTrigger");
+}
+
+export function getGsapScripts(document: Document): string[] {
+  return findScriptElementsDeep(document)
+    .map((script) => script.textContent ?? "")
+    .filter(isGsapScriptText);
+}
+
+export function findGsapScriptElement(document: Document): Element | null {
+  const scripts = findScriptElementsDeep(document);
+  return (
+    findTimelineScript(scripts) ??
+    scripts.find((s) => isGsapScriptText(s.textContent ?? "")) ??
+    null
+  );
 }
 
 export function getGsapScript(document: Document): string | null {

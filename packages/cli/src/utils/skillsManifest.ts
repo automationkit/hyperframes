@@ -17,7 +17,14 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -72,7 +79,8 @@ export interface SkillDiff {
 /** The pure manifest diff (current / outdated / missing — what `diffSkills` returns). */
 export interface SkillsDiff {
   updateAvailable: boolean;
-  summary: { current: number; outdated: number; missing: number };
+  /** `coreMissing` ⊆ `missing`: the missing skills that are core (see "Skill tiers"). */
+  summary: { current: number; outdated: number; missing: number; coreMissing: number };
   skills: SkillDiff[];
 }
 
@@ -84,7 +92,13 @@ export interface SkillsCheckResult {
   /** Scope of the located install — so a caller prunes in the same scope it attributed from. */
   scope: "project" | "global" | null;
   updateAvailable: boolean;
-  summary: { current: number; outdated: number; missing: number; removed: number };
+  summary: {
+    current: number;
+    outdated: number;
+    missing: number;
+    coreMissing: number;
+    removed: number;
+  };
   skills: SkillDiff[];
   /**
    * True when an install was located but the upstream skills lock was absent at
@@ -99,6 +113,52 @@ const DEFAULT_REPO_SLUG = "heygen-com/hyperframes";
 /** Manifest filename, published at the repo root. */
 export const MANIFEST_FILE = "skills-manifest.json";
 const FETCH_TIMEOUT_MS = 4000;
+
+// ── Skill tiers ──────────────────────────────────────────────────────────────
+//
+// Two tiers decide what installs eagerly vs on demand:
+//
+//   core     — the `/hyperframes` entry router plus the shared domain skills
+//              (`hyperframes-*`, `media-use`) that every creation workflow
+//              references structurally (sibling `../hyperframes-animation/…`
+//              paths, "call /media-use" preambles). These must be present and
+//              current for ANY workflow to run, so `init` / `skills update`
+//              keep them fresh.
+//   on-demand — everything else: the end-user workflow skills (pr-to-video,
+//              embedded-captions, …) and optional integrations (figma). They
+//              install lazily, when their workflow is actually triggered
+//              (`hyperframes skills update <name>`), instead of being sprayed
+//              onto every machine that runs `init`.
+
+/** The entry/router skill — the capability map that routes every request. */
+const ENTRY_SKILL = "hyperframes";
+
+/** True for skills every workflow depends on (see "Skill tiers" above). */
+export function isCoreSkill(name: string): boolean {
+  return name === ENTRY_SKILL || name.startsWith("hyperframes-") || name === "media-use";
+}
+
+/**
+ * Pinned enumeration of the core tier, used ONLY when the live manifest is
+ * unreachable (offline / rate-limited): isCoreSkill is a pattern, and a
+ * pattern can't be enumerated without a name list. Best-effort by design —
+ * if this lags the skills/ tree, the degraded path misses (or over-asks for)
+ * a core skill until the next release, and the online path self-corrects on
+ * the next run. A unit test pins this list to the repo's skills/ tree so it
+ * can't drift silently; update it when core membership changes.
+ */
+export const FALLBACK_CORE_SKILLS: readonly string[] = [
+  "hyperframes",
+  "hyperframes-animation",
+  "hyperframes-audio",
+  "hyperframes-cli",
+  "hyperframes-core",
+  "hyperframes-creative",
+  "hyperframes-keyframes",
+  "hyperframes-registry",
+  "hyperframes-studio",
+  "media-use",
+];
 
 // ── Hashing ────────────────────────────────────────────────────────────────
 
@@ -283,6 +343,20 @@ function locateInstall(
   return null;
 }
 
+/**
+ * Names from `skillNames` that are present (their SKILL.md exists) in the
+ * located install. Local-only — no manifest fetch — so callers can verify the
+ * presence half of an install guarantee even when GitHub is unreachable.
+ */
+export function presentSkills(
+  skillNames: readonly string[],
+  opts: { dir?: string; cwd?: string; home?: string } = {},
+): string[] {
+  const root = locateInstall([...skillNames], opts);
+  if (!root) return [];
+  return skillNames.filter((name) => existsSync(join(root.dir, name, "SKILL.md")));
+}
+
 /** Hash every manifest skill that is installed under `root`. */
 function hashInstalled(root: SkillRoot, skillNames: string[]): Record<string, SkillEntry> {
   const out: Record<string, SkillEntry> = {};
@@ -304,7 +378,7 @@ export function diffSkills(
   // one "ours but removed" via the lock's source attribution, never the bare
   // directory name — `.../skills` is shared across sources.
   const skills: SkillDiff[] = [];
-  const summary = { current: 0, outdated: 0, missing: 0 };
+  const summary = { current: 0, outdated: 0, missing: 0, coreMissing: 0 };
 
   for (const name of Object.keys(latest.skills).sort()) {
     const latestEntry = latest.skills[name]!;
@@ -316,7 +390,10 @@ export function diffSkills(
 
     if (status === "current") summary.current++;
     else if (status === "outdated") summary.outdated++;
-    else summary.missing++;
+    else {
+      summary.missing++;
+      if (isCoreSkill(name)) summary.coreMissing++;
+    }
 
     skills.push({
       name,
@@ -327,9 +404,14 @@ export function diffSkills(
   }
 
   return {
-    // The full skill set is the goal — `init` and `skills update` both pull the
-    // complete set, so anything outdated OR missing means an update is available.
-    updateAvailable: summary.outdated > 0 || summary.missing > 0,
+    // "Update available" means the install is stale, not merely partial:
+    // anything installed-but-outdated, or a missing CORE skill (the entry
+    // router + shared domain skills every workflow needs). A missing
+    // on-demand skill is NOT an update — it installs when its workflow is
+    // triggered (`hyperframes skills update <name>`). Counting it here is what
+    // used to make `init` re-pull the full skill set onto machines that
+    // deliberately installed a subset.
+    updateAvailable: summary.outdated > 0 || summary.coreMissing > 0,
     summary,
     skills,
   };
@@ -349,6 +431,13 @@ export function diffSkills(
 interface LockEntry {
   source?: string;
   sourceUrl?: string;
+  /**
+   * Path of the skill's SKILL.md within the source repo, as upstream records it
+   * (`skills/general-video/SKILL.md`, `.agents/skills/seam-craft/SKILL.md`). The
+   * only field distinguishing skills the published manifest covers from ones
+   * installed out of the same repo's other skill roots — see manifestCoversSkill.
+   */
+  skillPath?: string;
 }
 
 /** The slice of the vercel-labs/skills lock file we read. */
@@ -428,7 +517,42 @@ interface RemovedResult {
   lockMissing: boolean;
 }
 
-/** Skills the lock attributes to our source that the manifest no longer ships. */
+/**
+ * The repo directory the published manifest is generated from — see
+ * `packages/cli/scripts/gen-skills-manifest.ts`, which walks `<repoRoot>/skills`
+ * and nothing else. Anything installed from a DIFFERENT root of the same repo
+ * (`.claude/skills/`, `.agents/skills/` — the repo-native contributor skills) is
+ * outside the manifest's coverage, so the manifest says nothing about it.
+ */
+const MANIFEST_COVERAGE_ROOT = "skills/";
+
+/**
+ * Is the manifest authoritative about whether this skill still exists upstream?
+ *
+ * Only for skills installed from the directory the manifest is generated from.
+ * The lock records where in the repo each skill came from (`skillPath`, e.g.
+ * `skills/general-video/SKILL.md` vs `.agents/skills/seam-craft/SKILL.md`), and
+ * both carry the same `source`, so source attribution alone cannot tell them
+ * apart. An entry with no `skillPath` (older lock format) is treated as NOT
+ * covered — for a delete, unknown provenance must fail safe. GH #3111.
+ */
+function manifestCoversSkill(entry: LockEntry | undefined): boolean {
+  const path = entry?.skillPath;
+  return typeof path === "string" && path.startsWith(MANIFEST_COVERAGE_ROOT);
+}
+
+/**
+ * Skills the lock attributes to our source that the manifest no longer ships.
+ *
+ * "Absent from the manifest" only means "removed upstream" for skills the
+ * manifest actually covers. `skills add --skill '*'` installs every skill in the
+ * repo — including the repo-native ones under `.claude/skills/` and
+ * `.agents/skills/`, which the published manifest deliberately omits — and
+ * attributes them all to our source. Without the coverage filter, every install
+ * is immediately followed by a prune that deletes those skills as "no longer
+ * published", so `check || update` never converges: `add` reinstalls them and
+ * the next `update` deletes them again, forever. GH #3111.
+ */
 function detectRemoved(
   root: SkillRoot,
   latest: SkillsManifest,
@@ -436,10 +560,56 @@ function detectRemoved(
 ): RemovedResult {
   const lock = readSkillLock(lockPathForScope(root.scope, opts));
   const removed = skillsAttributedToSource(lock, latest.source)
+    .filter((name) => manifestCoversSkill(lock?.skills?.[name]))
     .filter((name) => !(name in latest.skills))
     .sort()
     .map((name) => ({ name, status: "removed" as const }));
   return { removed, lockMissing: lock === null };
+}
+
+/**
+ * Remove `names` from the vercel-labs/skills lock at `scope`, writing the file
+ * back if anything changed. Self-heals the half of removed-upstream detection
+ * that `skills remove` can't: upstream's `remove` command scans ON-DISK skill
+ * directories to decide what's installed (see vercel-labs/skills'
+ * `removeCommand`), so a lock entry for a skill retired before it ever shipped
+ * a bundle to this machine has no on-disk dir to match. That makes `skills
+ * remove <name> -g --yes` a silent no-op — it prints "No matching skills found
+ * for: …" and exits 0 WITHOUT touching the lock. Left alone, `detectRemoved`
+ * re-flags the same lock entry as "removed" on every future run, forever.
+ *
+ * Reuses the pinned lock path (see SKILLS_CLI_LOCK_PATHS_VERIFIED_AT above —
+ * re-check that comment before bumping the upstream version this is pinned
+ * against) so this writes to exactly where the upstream CLI itself reads and
+ * writes the lock.
+ *
+ * Idempotent by construction: only entries still present in the lock are ever
+ * touched, so calling this again with the same names — after the upstream
+ * `skills remove` no-op reported above has already run once — finds nothing
+ * left and returns `[]`.
+ */
+export function pruneOrphanedLockEntries(
+  names: readonly string[],
+  scope: "project" | "global",
+  opts: { cwd?: string; home?: string } = {},
+): string[] {
+  const path = lockPathForScope(scope, opts);
+  const lock = readSkillLock(path);
+  if (!lock?.skills) return [];
+  const pruned = names.filter((name) => name in lock.skills!);
+  if (pruned.length === 0) return [];
+  for (const name of pruned) delete lock.skills[name];
+  // Atomic write (temp file + rename, same pattern as telemetry/autoUpdate.ts
+  // and utils/download.ts) so a crash mid-write can never leave a truncated
+  // lock behind. `path` is guaranteed to exist here (readSkillLock already
+  // returned a non-null lock), so preserving its mode on the temp file before
+  // the rename is safe. No trailing newline: matches the upstream
+  // vercel-labs/skills lock's on-disk shape, so a prune stays a minimal diff.
+  const mode = statSync(path).mode & 0o777;
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(lock, null, 2), { mode });
+  renameSync(tmp, path);
+  return pruned;
 }
 
 // ── Resolving the "latest" manifest ──────────────────────────────────────────
@@ -494,7 +664,11 @@ async function remoteHeadSha(repoSlug: string): Promise<string | null> {
     const { stdout } = await execFileAsync(
       "git",
       ["ls-remote", `https://github.com/${repoSlug}.git`, "refs/heads/main"],
-      { timeout: FETCH_TIMEOUT_MS, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
+      {
+        timeout: FETCH_TIMEOUT_MS,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        windowsHide: true,
+      },
     );
     const sha = stdout.split(/\s+/)[0]?.trim() ?? "";
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
@@ -540,17 +714,27 @@ async function fetchRemoteManifest(source?: string): Promise<SkillsManifest> {
  *   - undefined → in-repo manifest if present (dev / CI), else fetch from GitHub
  *   - a local path to a manifest file or a repo root containing `skills/`
  *   - an `owner/repo` slug or full URL → fetched from GitHub
+ *
+ * `canonical: true` skips the in-repo shortcut (the `!source` branch below)
+ * even when one is found, and always resolves over the network instead. Use
+ * it for any decision that must match what `skills add` actually installs
+ * from — the canonical published repo — never a local checkout's manifest,
+ * which can be stale (e.g. still listing a skill that was retired/renamed
+ * upstream since that checkout's last pull). An explicit local `source`
+ * override is a deliberate caller choice and still wins regardless of
+ * `canonical`.
  */
 async function resolveLatestManifest(
   source?: string,
   cwd = process.cwd(),
+  opts: { canonical?: boolean } = {},
 ): Promise<SkillsManifest> {
   // A local path is a relative one (./ ../) or an absolute one — isAbsolute
   // covers POSIX `/…` and Windows `C:\…` / `\…` on their respective platforms.
   if (source && (source.startsWith(".") || isAbsolute(source))) {
     return resolveLocalManifest(source);
   }
-  if (!source) {
+  if (!source && !opts.canonical) {
     const repoManifest = findRepoManifest(cwd);
     if (repoManifest) return JSON.parse(readFileSync(repoManifest, "utf8")) as SkillsManifest;
   }
@@ -562,9 +746,16 @@ async function resolveLatestManifest(
  * manifest. Pure-ish (network only via `resolveLatestManifest`).
  */
 export async function checkSkills(
-  opts: { dir?: string; source?: string; cwd?: string; home?: string } = {},
+  opts: {
+    dir?: string;
+    source?: string;
+    cwd?: string;
+    home?: string;
+    /** See resolveLatestManifest — bypass the in-repo manifest shortcut. */
+    canonical?: boolean;
+  } = {},
 ): Promise<SkillsCheckResult> {
-  const latest = await resolveLatestManifest(opts.source, opts.cwd);
+  const latest = await resolveLatestManifest(opts.source, opts.cwd, { canonical: opts.canonical });
   const skillNames = Object.keys(latest.skills);
   const root = locateInstall(skillNames, { dir: opts.dir, cwd: opts.cwd, home: opts.home });
   const installed = root ? hashInstalled(root, skillNames) : {};

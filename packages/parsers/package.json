@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/parsers",
-  "version": "0.7.26",
+  "version": "0.8.153",
   "repository": {
     "type": "git",
     "url": "https://github.com/heygen-com/hyperframes",
@@ -82,11 +82,65 @@
       "import": "./src/composition.ts",
       "types": "./src/composition.ts"
     },
+    "./composition-contract": {
+      "bun": "./src/compositionContract.ts",
+      "node": "./dist/compositionContract.js",
+      "import": "./src/compositionContract.ts",
+      "types": "./src/compositionContract.ts"
+    },
+    "./media-duration": {
+      "bun": "./src/mediaDuration.ts",
+      "node": "./dist/mediaDuration.js",
+      "import": "./src/mediaDuration.ts",
+      "types": "./src/mediaDuration.ts"
+    },
+    "./media-duration-fixtures": {
+      "bun": "./src/mediaDurationFixtures.ts",
+      "node": "./dist/mediaDurationFixtures.js",
+      "import": "./src/mediaDurationFixtures.ts",
+      "types": "./src/mediaDurationFixtures.ts"
+    },
+    "./top-level-elements": {
+      "bun": "./src/topLevelElements.ts",
+      "node": "./dist/topLevelElements.js",
+      "import": "./src/topLevelElements.ts",
+      "types": "./src/topLevelElements.ts"
+    },
+    "./color-grading-contract": {
+      "bun": "./src/colorGradingContract.ts",
+      "node": "./dist/colorGradingContract.js",
+      "import": "./src/colorGradingContract.ts",
+      "types": "./src/colorGradingContract.ts"
+    },
     "./sub-composition-validity": {
       "bun": "./src/subCompositionValidity.ts",
       "node": "./dist/subCompositionValidity.js",
       "import": "./src/subCompositionValidity.ts",
       "types": "./src/subCompositionValidity.ts"
+    },
+    "./ff-binaries": {
+      "bun": "./src/ffBinaries.ts",
+      "node": "./dist/ffBinaries.js",
+      "import": "./src/ffBinaries.ts",
+      "types": "./src/ffBinaries.ts"
+    },
+    "./asset-resolution": {
+      "bun": "./src/assetResolution.ts",
+      "node": "./dist/assetResolution.js",
+      "import": "./src/assetResolution.ts",
+      "types": "./src/assetResolution.ts"
+    },
+    "./html-attribute-spans": {
+      "bun": "./src/htmlAttributeSpans.ts",
+      "node": "./dist/htmlAttributeSpans.js",
+      "import": "./src/htmlAttributeSpans.ts",
+      "types": "./src/htmlAttributeSpans.ts"
+    },
+    "./composition-duration": {
+      "bun": "./src/compositionDuration.ts",
+      "node": "./dist/compositionDuration.js",
+      "import": "./src/compositionDuration.ts",
+      "types": "./src/compositionDuration.ts"
     }
   },
   "publishConfig": {
@@ -137,9 +191,45 @@
         "import": "./dist/composition.js",
         "types": "./dist/composition.d.ts"
       },
+      "./composition-contract": {
+        "import": "./dist/compositionContract.js",
+        "types": "./dist/compositionContract.d.ts"
+      },
+      "./media-duration": {
+        "import": "./dist/mediaDuration.js",
+        "types": "./dist/mediaDuration.d.ts"
+      },
+      "./media-duration-fixtures": {
+        "import": "./dist/mediaDurationFixtures.js",
+        "types": "./dist/mediaDurationFixtures.d.ts"
+      },
+      "./top-level-elements": {
+        "import": "./dist/topLevelElements.js",
+        "types": "./dist/topLevelElements.d.ts"
+      },
+      "./color-grading-contract": {
+        "import": "./dist/colorGradingContract.js",
+        "types": "./dist/colorGradingContract.d.ts"
+      },
       "./sub-composition-validity": {
         "import": "./dist/subCompositionValidity.js",
         "types": "./dist/subCompositionValidity.d.ts"
+      },
+      "./ff-binaries": {
+        "import": "./dist/ffBinaries.js",
+        "types": "./dist/ffBinaries.d.ts"
+      },
+      "./asset-resolution": {
+        "import": "./dist/assetResolution.js",
+        "types": "./dist/assetResolution.d.ts"
+      },
+      "./html-attribute-spans": {
+        "import": "./dist/htmlAttributeSpans.js",
+        "types": "./dist/htmlAttributeSpans.d.ts"
+      },
+      "./composition-duration": {
+        "import": "./dist/compositionDuration.js",
+        "types": "./dist/compositionDuration.d.ts"
       }
     },
     "main": "./dist/index.js",
@@ -156,6 +246,7 @@
     "@babel/parser": "^7.27.0",
     "acorn": "^8.17.0",
     "acorn-walk": "^8.3.5",
+    "entities": "^7.0.1",
     "linkedom": "^0.18.12",
     "magic-string": "^0.30.21",
     "recast": "^0.23.11"
@@ -166,6 +257,6 @@
     "tsup": "^8.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.0.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

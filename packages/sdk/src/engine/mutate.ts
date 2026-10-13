@@ -1,3 +1,4 @@
+import { replacementTimelineAssetId } from "@hyperframes/core/timeline-asset-id";
 /**
  * Op handlers for Phase 3a (non-parser ops).
  *
@@ -17,10 +18,13 @@ import type {
   JsonPatchOp,
 } from "../types.js";
 import type { ParsedDocument } from "./model.js";
+import { MEDIA_LINK_ATTR, linkScopeOf } from "@hyperframes/core/media-link";
+import { idsToUnlink, linkedPartnerIds } from "./linkedTiming.js";
 import {
   resolveScoped,
   escapeHfId,
   findRoot,
+  declarationElement,
   getElementStyles,
   setElementStyles,
   toCamel,
@@ -28,6 +32,7 @@ import {
   setOwnText,
   getSiblingIndex,
   getGsapScript,
+  findGsapScriptElement,
   setGsapScript,
   getStyleSheet,
   setStyleSheet,
@@ -40,6 +45,7 @@ import {
   holdPath,
   elementPath,
   variablePath,
+  variableDeclPath,
   metaPath,
   gsapScriptPath,
   styleSheetPath,
@@ -51,6 +57,8 @@ import {
 } from "./patches.js";
 import { upsertCssRule } from "./cssWriter.js";
 import { mintHfId, EXCLUDED_TAGS } from "@hyperframes/core/hf-ids";
+import { EDIT_BASE_X_ATTR, EDIT_BASE_Y_ATTR } from "@hyperframes/core/runtime/position-edits";
+import { readClipTiming, writeClipTiming } from "@hyperframes/core/composition-contract";
 import { parseGsapScriptAcornForWrite } from "@hyperframes/core/gsap-parser-acorn";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import {
@@ -73,9 +81,23 @@ import {
   updateArcSegmentInScript,
   removeArcPathFromScript,
   unrollDynamicAnimations,
+  clipQueryRoot,
+  clipTweenMatcher,
+  hasExplicitTime,
 } from "@hyperframes/core/gsap-writer-acorn";
 import { deriveKeyframeBackfillDefaults } from "./keyframeBackfill.js";
-import { readVariableDefault, writeVariableDefault } from "./variableModel.js";
+import {
+  readVariableDefault,
+  writeVariableDefault,
+  findVariableDeclaration,
+  writeVariableDeclaration,
+  removeVariableDeclarationEntry,
+} from "./variableModel.js";
+import {
+  isCompositionVariable,
+  isScalarVariableValue as isScalar,
+} from "@hyperframes/core/variables";
+import type { CompositionVariable } from "@hyperframes/core/variables";
 import {
   URI_BEARING_ATTRS,
   DANGEROUS_URI_SCHEMES,
@@ -117,7 +139,7 @@ function validateSetAttribute(name: string, value: string | null): void {
   }
   if (lower.startsWith("on")) {
     throw new Error(
-      `setAttribute: event-handler attributes ("${name}") are not permitted — ` +
+      `setAttribute: event-handler attributes ("${name}") are not permitted: ` +
         `they produce executable HTML that cannot be safely serialized.`,
     );
   }
@@ -257,6 +279,118 @@ function applyGsapOp(parsed: ParsedDocument, op: EditOp): MutationResult | undef
   }
 }
 
+const concatResults = (a: MutationResult, b: MutationResult): MutationResult => ({
+  forward: [...a.forward, ...b.forward],
+  inverse: [...a.inverse, ...b.inverse],
+});
+
+/**
+ * Timing edits apply to link partners too (start/duration; each keeps its own
+ * track). `linked: false` edits the targets alone and unlinks them.
+ */
+function applySetTiming(
+  parsed: ParsedDocument,
+  op: Extract<EditOp, { type: "setTiming" }>,
+): MutationResult {
+  const ids = targets(op.target);
+  const timing = { start: op.start, duration: op.duration, trackIndex: op.trackIndex };
+  if (op.linked === false) {
+    const unlink = idsToUnlink(parsed.document, ids);
+    const own = handleSetTiming(parsed, ids, timing);
+    return concatResults(own, handleSetAttribute(parsed, unlink, MEDIA_LINK_ATTR, null));
+  }
+  const plan = planLinkedTiming(parsed, ids, timing);
+  if (plan.refusal) throw new Error(plan.refusal);
+  let result = handleSetTiming(parsed, ids, timing);
+  for (const partner of plan.partners) {
+    result = concatResults(result, handleSetTiming(parsed, [partner.id], partner.timing));
+  }
+  return result;
+}
+
+type PartnerEdit = { id: HfId; timing: { start?: number; duration?: number } };
+
+function planLinkedTiming(
+  parsed: ParsedDocument,
+  ids: HfId[],
+  timing: { start?: number; duration?: number },
+): { partners: PartnerEdit[]; refusal: string | null } {
+  if (timing.start === undefined && timing.duration === undefined) {
+    return { partners: [], refusal: null };
+  }
+  const grabbedFor = grabbedBaselines(parsed, ids);
+  const partners: PartnerEdit[] = [];
+  for (const id of linkedPartnerIds(parsed.document, ids)) {
+    const el = resolveScoped(parsed.document, id);
+    const grabbed = el ? grabbedFor(el) : undefined;
+    if (!el || !grabbed) continue;
+    const partnerEdit = partnerTiming(grabbed, readClipTiming(el), timing);
+    if (partnerEdit.duration !== undefined && partnerEdit.duration <= 0) {
+      const tag = el.tagName.toLowerCase();
+      return {
+        partners: [],
+        refusal: `Linked ${tag} would start after the new end. Unlink or trim the ${tag} first.`,
+      };
+    }
+    partners.push({ id, timing: partnerEdit });
+  }
+  return { partners, refusal: null };
+}
+
+type ClipWindow = { start: number | null; duration: number | null };
+
+function grabbedBaselines(
+  parsed: ParsedDocument,
+  ids: HfId[],
+): (partner: Element) => ClipWindow | undefined {
+  const byScope = new Map<Element | null, Map<string, ClipWindow>>();
+  for (const id of ids) {
+    const el = resolveScoped(parsed.document, id);
+    const link = el?.getAttribute(MEDIA_LINK_ATTR);
+    if (!el || !link) continue;
+    const byLink = byScope.get(linkScopeOf(el)) ?? new Map<string, ClipWindow>();
+    byLink.set(link, readClipTiming(el));
+    byScope.set(linkScopeOf(el), byLink);
+  }
+  return (partner) => {
+    const link = partner.getAttribute(MEDIA_LINK_ATTR);
+    return link ? byScope.get(linkScopeOf(partner))?.get(link) : undefined;
+  };
+}
+const ALIGN_EPSILON_S = 1e-3;
+
+/**
+ * A partner follows the edit without resyncing: a start change shifts it by the
+ * same delta (keeping any offset); a duration change carries over only when the
+ * partner's end sat at the edited clip's end.
+ */
+function partnerTiming(
+  grabbed: ClipWindow,
+  partner: ClipWindow,
+  edit: { start?: number; duration?: number },
+): { start?: number; duration?: number } {
+  const timing: { start?: number; duration?: number } = {};
+  const [gStart, pStart] = [grabbed.start ?? 0, partner.start ?? 0];
+  if (edit.start !== undefined) timing.start = pStart + (edit.start - gStart);
+  const duration = partnerDuration(grabbed, partner, edit, timing.start ?? pStart);
+  if (duration !== undefined) timing.duration = duration;
+  return timing;
+}
+
+function partnerDuration(
+  grabbed: ClipWindow,
+  partner: ClipWindow,
+  edit: { start?: number; duration?: number },
+  partnerStart: number,
+): number | undefined {
+  if (edit.duration === undefined) return undefined;
+  const grabbedStart = grabbed.start ?? 0;
+  const grabbedEnd = grabbedStart + (grabbed.duration ?? 0);
+  const partnerEnd = (partner.start ?? 0) + (partner.duration ?? 0);
+  if (Math.abs(partnerEnd - grabbedEnd) >= ALIGN_EPSILON_S) return undefined;
+  return (edit.start ?? grabbedStart) + edit.duration - partnerStart;
+}
+
 export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
   const gsap = applyGsapOp(parsed, op);
   if (gsap !== undefined) return gsap;
@@ -268,11 +402,7 @@ export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
     case "setAttribute":
       return handleSetAttribute(parsed, targets(op.target), op.name, op.value);
     case "setTiming":
-      return handleSetTiming(parsed, targets(op.target), {
-        start: op.start,
-        duration: op.duration,
-        trackIndex: op.trackIndex,
-      });
+      return applySetTiming(parsed, op);
     case "setHold":
       return handleSetHold(parsed, targets(op.target), op.hold);
     case "moveElement":
@@ -287,6 +417,16 @@ export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
       return handleSetCompositionMetadata(parsed, op);
     case "setVariableValue":
       return handleSetVariableValue(parsed, op.id, op.value);
+    case "declareVariable":
+      return handleDeclareVariable(parsed, op.declaration);
+    case "updateVariableDeclaration":
+      return handleUpdateVariableDeclaration(parsed, op.id, op.declaration);
+    case "removeVariableDeclaration":
+      return handleRemoveVariableDeclaration(parsed, op.id);
+    case "removeVariable":
+      // #2098 alias — delegate to the canonical handler so its patch grammar
+      // and undo inverse match the rest of the variable-declaration ops.
+      return handleRemoveVariableDeclaration(parsed, op.id);
     case "setClassStyle":
       return handleSetClassStyle(parsed, op.selector, op.styles);
     case "addLabel":
@@ -342,11 +482,34 @@ function handleMoveElement(
 ): MutationResult {
   // HF elements are positioned via data-x / data-y (parsed by htmlParser.ts,
   // emitted by hyperframes generator). CSS left/top is not the convention.
-  const rx = handleSetAttribute(parsed, ids, "data-x", String(x));
-  const ry = handleSetAttribute(parsed, ids, "data-y", String(y));
+  //
+  // The pre-edit values are captured once per element into
+  // data-hf-edit-base-x/y. The runtime (core runtime/positionEdits.ts) renders
+  // the edit as translate(data-x − base, data-y − base), which composes with
+  // GSAP-animated transforms instead of being overwritten per-axis.
+  const parts: MutationResult[] = [];
+  for (const id of ids) {
+    const el = resolveScoped(parsed.document, id);
+    if (!el) continue;
+    if (el.getAttribute(EDIT_BASE_X_ATTR) === null) {
+      parts.push(
+        handleSetAttribute(parsed, [id], EDIT_BASE_X_ATTR, el.getAttribute("data-x") ?? "0"),
+      );
+    }
+    if (el.getAttribute(EDIT_BASE_Y_ATTR) === null) {
+      parts.push(
+        handleSetAttribute(parsed, [id], EDIT_BASE_Y_ATTR, el.getAttribute("data-y") ?? "0"),
+      );
+    }
+  }
+  parts.push(handleSetAttribute(parsed, ids, "data-x", String(x)));
+  parts.push(handleSetAttribute(parsed, ids, "data-y", String(y)));
   return {
-    forward: [...rx.forward, ...ry.forward],
-    inverse: [...ry.inverse, ...rx.inverse],
+    forward: parts.flatMap((p) => p.forward),
+    inverse: parts
+      .slice()
+      .reverse()
+      .flatMap((p) => p.inverse),
   };
 }
 
@@ -383,6 +546,14 @@ function handleSetAttribute(
     const oldValue = el.getAttribute(name);
     const path = attrPath(id, name);
     if (value !== null) {
+      const replacementId =
+        name === "src" ? replacementTimelineAssetId(parsed.document, el, value) : null;
+      if (replacementId !== null) {
+        const idPatch = scalarChange(attrPath(id, "id"), el.getAttribute("id"), replacementId);
+        el.setAttribute("id", replacementId);
+        result.forward.push(idPatch.forward);
+        result.inverse.push(idPatch.inverse);
+      }
       el.setAttribute(name, value);
       const p = scalarChange(path, oldValue, value);
       result.forward.push(p.forward);
@@ -409,100 +580,103 @@ function handleSetTiming(
   // we avoid re-fetching the script element on every iteration.
   const origScript = getGsapScript(parsed.document);
   const parsedGsap = origScript ? parseGsapScriptAcornForWrite(origScript) : null;
+  const scriptElement = findGsapScriptElement(parsed.document);
+  const clipRoot = scriptElement ? clipQueryRoot(scriptElement) : parsed.document;
   let currentScript = origScript;
 
   for (const id of ids) {
     const el = resolveScoped(parsed.document, id);
     if (!el) continue;
 
-    const oldStartStr = el.getAttribute("data-start");
-    const oldEndStr = el.getAttribute("data-end");
-    const oldDurationStr = el.getAttribute("data-duration");
-    const oldTrackStr = el.getAttribute("data-track-index");
-
-    const oldStart = oldStartStr !== null ? parseFloat(oldStartStr) : null;
-    const oldEnd = oldEndStr !== null ? parseFloat(oldEndStr) : null;
-    const oldDurationAttr = oldDurationStr !== null ? parseFloat(oldDurationStr) : null;
-    // Prefer an explicit data-duration — the attribute clips are authored with and
-    // the runtime reads — falling back to data-end − data-start. Reading only
-    // data-end left oldDuration null for duration-authored clips, collapsing the
-    // GSAP duration-scale ratio to 1 and scaling nothing.
-    const oldDuration =
-      oldDurationAttr !== null
-        ? oldDurationAttr
-        : oldStart !== null && oldEnd !== null
-          ? oldEnd - oldStart
-          : null;
-    const oldTrack = oldTrackStr !== null ? parseInt(oldTrackStr, 10) : null;
+    const beforeAttributes = {
+      start: el.getAttribute("data-start"),
+      duration: el.getAttribute("data-duration"),
+      end: el.getAttribute("data-end"),
+      trackIndex: el.getAttribute("data-track-index"),
+      layer: el.getAttribute("data-layer"),
+    };
+    const oldTiming = readClipTiming(el);
+    const oldStart = oldTiming.start;
+    const oldDuration = oldTiming.duration;
 
     const newStart = timing.start ?? oldStart;
     const newDuration = timing.duration ?? oldDuration;
 
-    if (timing.start !== undefined && newStart !== null) {
-      const path = timingPath(id, "start");
-      const p = scalarChange(path, oldStart, newStart);
-      result.forward.push(p.forward);
-      result.inverse.push(p.inverse);
-      el.setAttribute("data-start", String(newStart));
-    }
+    writeClipTiming(el, timing);
+    const afterAttributes = {
+      start: el.getAttribute("data-start"),
+      duration: el.getAttribute("data-duration"),
+      end: el.getAttribute("data-end"),
+      trackIndex: el.getAttribute("data-track-index"),
+      layer: el.getAttribute("data-layer"),
+    };
 
-    // Write to whichever timing attribute the clip actually uses. A data-duration
-    // clip updates data-duration only on a real resize (duration is invariant
-    // under a move); a data-end clip updates data-end whenever start or duration
-    // changes (end = start + duration). Writing a fresh data-end beside a stale
-    // data-duration had no playback effect.
-    if (oldDurationStr !== null) {
-      if (timing.duration !== undefined && newDuration !== null) {
-        const path = timingPath(id, "duration");
-        const p = scalarChange(path, oldDurationAttr, newDuration);
-        result.forward.push(p.forward);
-        result.inverse.push(p.inverse);
-        el.setAttribute("data-duration", String(newDuration));
+    const recordAttributeChange = (
+      path: string,
+      before: string | null,
+      after: string | null,
+      numeric: boolean,
+    ) => {
+      if (before === after) return;
+      const toPatchValue = (value: string): string | number => {
+        if (!numeric) return value;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : value;
+      };
+      if (after === null) {
+        if (before === null) return;
+        const patch = scalarDelete(path, toPatchValue(before));
+        result.forward.push(patch.forward);
+        result.inverse.push(patch.inverse);
+        return;
       }
-      // A clip carrying BOTH data-duration and data-end must keep data-end in
-      // sync (end = start + duration) on any start/duration change, else the
-      // stale data-end inverts the clip (end < start) for runtimes that read it.
-      if (oldEndStr !== null && newStart !== null && newDuration !== null) {
-        const newEnd = newStart + newDuration;
-        const endPath = timingPath(id, "end");
-        const ep = scalarChange(endPath, oldEnd, newEnd);
-        result.forward.push(ep.forward);
-        result.inverse.push(ep.inverse);
-        el.setAttribute("data-end", String(newEnd));
-      }
-    } else if (
-      (timing.duration !== undefined || timing.start !== undefined) &&
-      newStart !== null &&
-      newDuration !== null
-    ) {
-      const newEnd = newStart + newDuration;
-      // Store the computed end value directly (not the logical duration) so the inverse
-      // patch is self-contained and doesn't require data-start to be restored first.
-      const path = timingPath(id, "end");
-      const p = scalarChange(path, oldEnd, newEnd);
-      result.forward.push(p.forward);
-      result.inverse.push(p.inverse);
-      el.setAttribute("data-end", String(newEnd));
-    }
+      const oldValue = before === null ? null : toPatchValue(before);
+      const newValue = toPatchValue(after);
+      const patch = scalarChange(path, oldValue, newValue);
+      result.forward.push(patch.forward);
+      result.inverse.push(patch.inverse);
+    };
 
-    if (timing.trackIndex !== undefined) {
-      const newTrack = timing.trackIndex;
-      const path = timingPath(id, "trackIndex");
-      const p = scalarChange(path, oldTrack, newTrack);
-      result.forward.push(p.forward);
-      result.inverse.push(p.inverse);
-      el.setAttribute("data-track-index", String(newTrack));
-    }
+    recordAttributeChange(
+      timingPath(id, "start"),
+      beforeAttributes.start,
+      afterAttributes.start,
+      true,
+    );
+    recordAttributeChange(
+      timingPath(id, "duration"),
+      beforeAttributes.duration,
+      afterAttributes.duration,
+      true,
+    );
+    recordAttributeChange(timingPath(id, "end"), beforeAttributes.end, afterAttributes.end, true);
+    recordAttributeChange(
+      timingPath(id, "trackIndex"),
+      beforeAttributes.trackIndex,
+      afterAttributes.trackIndex,
+      true,
+    );
+    recordAttributeChange(
+      attrPath(id, "data-layer"),
+      beforeAttributes.layer,
+      afterAttributes.layer,
+      false,
+    );
 
     // Sync GSAP tween positions: the GSAP script is the source of truth at play time —
     // the timeline rebuilds from it on every seek. Without this, DOM attribute edits
     // have zero playback effect; the script's position/duration silently overrides them.
-    // Match against BOTH the element's data-hf-id (the canonical form) AND its DOM
-    // id: the Studio GSAP panel / ensureElementAddressable author tweens as
-    // `#domId`, which selectorMatchesId(hfId) never matched — so moving/resizing
-    // those clips left their tweens unsynced.
-    const matchHfId = el.getAttribute("data-hf-id") ?? id;
-    const matchDomId = el.getAttribute("id");
+    const hfId = el.getAttribute("data-hf-id") ?? id;
+    const domId = el.getAttribute("id");
+    const carries = clipTweenMatcher(
+      [
+        `[data-hf-id="${hfId}"]`,
+        `[data-hf-id='${hfId}']`,
+        `#${hfId}`,
+        ...(domId ? [`#${domId}`] : []),
+      ],
+      clipRoot,
+    );
     if (parsedGsap && currentScript) {
       // A missing data-start means an implicit start of 0 (matching the server
       // shiftGsapPositions path); a malformed attr parses to NaN. Sanitize to a
@@ -522,10 +696,7 @@ function handleSetTiming(
           : 1;
       const remapStart = startChanged && newStart !== null ? newStart : oldStartNum;
       for (const { id: animId, animation } of parsedGsap.located) {
-        const matches =
-          selectorMatchesId(animation.targetSelector, matchHfId) ||
-          (matchDomId !== null && selectorMatchesId(animation.targetSelector, matchDomId));
-        if (!matches) continue;
+        if (!carries(animation)) continue;
         // Skip tweens whose position is a label or relative string ("+=0.5",
         // "<", ">"): relative positions already track their neighbours, and a
         // string position can't be safely shifted by the clip delta here.
@@ -537,7 +708,7 @@ function handleSetTiming(
         // explicit position arg → parsed as implicitPosition): the writer would
         // APPEND a position arg, collapsing the stagger onto one point. Duration
         // still scales below.
-        if ((startChanged || durChanged) && animation.implicitPosition !== true) {
+        if ((startChanged || durChanged) && hasExplicitTime(animation)) {
           const shifted = remapStart + (animation.position - oldStartNum) * ratio;
           updates.position = Math.max(0, Math.round(shifted * 1000) / 1000);
         }
@@ -551,6 +722,7 @@ function handleSetTiming(
   }
 
   // Flush accumulated GSAP script changes as a single patch pair.
+  // fallow-ignore-next-line code-duplication
   if (origScript && currentScript && currentScript !== origScript) {
     setGsapScript(parsed.document, currentScript);
     const gsapResult = gsapScriptChange(origScript, currentScript);
@@ -620,6 +792,7 @@ function handleRemoveElement(parsed: ParsedDocument, ids: HfId[]): MutationResul
     }
   }
 
+  // fallow-ignore-next-line code-duplication
   if (origScript && currentScript && currentScript !== origScript) {
     setGsapScript(parsed.document, currentScript);
     const gsapResult = gsapScriptChange(origScript, currentScript);
@@ -821,44 +994,199 @@ function handleSetVariableValue(
 ): MutationResult {
   const root = findRoot(parsed.document);
   if (!root) return EMPTY;
+  const declEl = declarationElement(parsed.document, parsed.wrapped, id);
 
   const modelPath = variablePath(id);
-  const oldVarDefault = readVariableDefault(parsed.document, id);
+  const oldVarDefault = readVariableDefault(declEl, id);
 
-  if (isObjectVariableValue(value)) {
-    // Object values (font / image): write to JSON model only — objects are not
-    // valid CSS custom property values (LOCKED §7).
-    writeVariableDefault(parsed.document, id, value);
-    const p = valueChange(modelPath, oldVarDefault ?? null, value);
-    return { forward: [p.forward], inverse: [p.inverse] };
-  }
-
-  // Scalar values: update the JSON model (B1 — drives the runtime) and also
-  // keep the CSS custom prop as secondary / compat for compositions that
-  // CSS-bind directly to --{id}.
-  const cssVar = `--${id}`;
-  const rootId = root.getAttribute("data-hf-id");
-  const oldStyles = getElementStyles(root);
-  const oldCssValue = oldStyles[cssVar] ?? null;
-  const newVal = String(value);
-  setElementStyles(root, { [cssVar]: newVal });
-  writeVariableDefault(parsed.document, id, value);
-
-  // Emit explicit patches for both the JSON model (canonical) and the CSS compat
-  // prop. Keeping them separate means apply-patches.ts can handle each path type
-  // purely (variable path → model only; style path → CSS only), so inverse patches
-  // correctly restore the exact pre-call state without CSS-side-effect ambiguity.
+  // Update the JSON model (B1 — drives the runtime) and keep the CSS custom
+  // prop as secondary / compat for compositions that CSS-bind directly to
+  // --{id}. Object values (font / image) are not valid CSS custom property
+  // values (LOCKED §7) — cssCompatChange clears any stale scalar prop instead.
+  // Emitting separate model + style patches keeps apply-patches.ts pure per
+  // path type, so inverse patches restore the exact pre-call state.
+  writeVariableDefault(declEl, id, value);
   const modelP = valueChange(modelPath, oldVarDefault ?? null, value);
   const forward: JsonPatchOp[] = [modelP.forward];
   const inverse: JsonPatchOp[] = [modelP.inverse];
 
-  if (rootId) {
-    const cssPatch = scalarChange(stylePath(rootId, cssVar), oldCssValue, newVal);
-    forward.push(cssPatch.forward);
-    inverse.push(cssPatch.inverse);
+  const css = cssCompatChange(parsed, id, isObjectVariableValue(value) ? null : String(value));
+  if (css) {
+    forward.push(css.forward);
+    inverse.push(css.inverse);
   }
 
   return { forward, inverse };
+}
+
+/**
+ * Keep the `--{id}` CSS compat custom property on the root in sync with a
+ * scalar default (same secondary channel handleSetVariableValue maintains).
+ * Pass null to clear. Returns the patch pair, or null when there is no root
+ * or nothing to change.
+ */
+function cssCompatChange(
+  parsed: ParsedDocument,
+  id: string,
+  newVal: string | null,
+): { forward: JsonPatchOp; inverse: JsonPatchOp } | null {
+  const root = findRoot(parsed.document);
+  const rootId = root?.getAttribute("data-hf-id");
+  if (!root || !rootId) return null;
+  const cssVar = `--${id}`;
+  const oldCssValue = getElementStyles(root)[cssVar] ?? null;
+  if (newVal !== null) {
+    if (oldCssValue === newVal) return null;
+    setElementStyles(root, { [cssVar]: newVal });
+    return scalarChange(stylePath(rootId, cssVar), oldCssValue, newVal);
+  }
+  if (oldCssValue === null) return null;
+  setElementStyles(root, { [cssVar]: null });
+  return scalarDelete(stylePath(rootId, cssVar), oldCssValue);
+}
+
+/**
+ * Declaration ops need an element that survives serialize() to carry
+ * `data-composition-variables`. Full-document comps use `<html>`; wrapped
+ * template/fragment comps use their composition root div (the synthetic
+ * `<html>` is stripped on save). Only a wrapped input with no root element at
+ * all (an empty body) has nowhere durable to write.
+ */
+function fragmentCompositionErr(parsed: ParsedDocument): CanResult | null {
+  if (declarationElement(parsed.document, parsed.wrapped)) return null;
+  return canErr(
+    "E_FRAGMENT_COMPOSITION",
+    "Fragment compositions cannot carry variable declarations.",
+    "The composition has no root element to hold data-composition-variables. Add a composition root or convert to a full HTML document.",
+  );
+}
+
+function invalidDeclarationErr(): CanResult {
+  return canErr(
+    "E_INVALID_ARGS",
+    "Not a valid variable declaration.",
+    "Requires id, label, type (string|number|color|boolean|enum|font|image), and a default matching the type; enum also requires options[].",
+  );
+}
+
+// A variable id becomes a CSS custom-property name (`--{id}`), a `data-var-*`
+// attribute value, and a CLI `--variables` key. isCompositionVariable only
+// checks it is a non-empty string, so the SDK — the last gate before Studio /
+// CSS / CLI make those assumptions — enforces a safe identifier shape here.
+const VALID_VARIABLE_ID = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+function isValidVariableId(id: string): boolean {
+  return VALID_VARIABLE_ID.test(id);
+}
+
+function invalidVariableIdErr(id: string): CanResult {
+  return canErr(
+    "E_INVALID_VARIABLE_ID",
+    `Variable id ${JSON.stringify(id)} is not a valid identifier.`,
+    "Ids must match /^[A-Za-z_][A-Za-z0-9_-]*$/ because they become CSS custom-property names (--id), data-var-* attribute values, and CLI --variables keys.",
+  );
+}
+
+/**
+ * Shared can() precondition for declareVariable/updateVariableDeclaration:
+ * refuse fragment compositions, non-declaration shapes, and malformed ids.
+ * Returns the CanResult to surface, or null when the declaration is well-formed.
+ * The shape check runs before the id access so a null/non-object declaration
+ * yields a CanResult, not a TypeError.
+ */
+function declarationPreconditionErr(
+  parsed: ParsedDocument,
+  declaration: CompositionVariable,
+): CanResult | null {
+  const fragmentErr = fragmentCompositionErr(parsed);
+  if (fragmentErr) return fragmentErr;
+  if (!isCompositionVariable(declaration)) return invalidDeclarationErr();
+  if (!isValidVariableId(declaration.id)) return invalidVariableIdErr(declaration.id);
+  return null;
+}
+
+function handleDeclareVariable(
+  parsed: ParsedDocument,
+  declaration: CompositionVariable,
+): MutationResult {
+  // Defensive re-check of can(): never write an invalid or duplicate
+  // declaration into the schema. Resolve the element that survives serialize
+  // (root div for wrapped template comps, <html> otherwise); no element = a
+  // bare fragment where a declaration would be lost on save.
+  const declEl = declarationElement(parsed.document, parsed.wrapped);
+  if (!declEl) return EMPTY;
+  if (!isCompositionVariable(declaration)) return EMPTY;
+  if (!isValidVariableId(declaration.id)) return EMPTY;
+  const existing = declarationElement(parsed.document, parsed.wrapped, declaration.id);
+  if (findVariableDeclaration(existing, declaration.id) !== undefined) return EMPTY;
+  if (!writeVariableDeclaration(declEl, declaration)) return EMPTY;
+  const path = variableDeclPath(declaration.id);
+  const result: MutationResult = {
+    forward: [patchAdd(path, declaration)],
+    inverse: [patchRemove(path)],
+  };
+  // Same CSS compat channel every other variable op maintains — a composition
+  // CSS-bound to var(--id) must resolve regardless of which op set the value.
+  if (isScalar(declaration.default)) {
+    const css = cssCompatChange(parsed, declaration.id, String(declaration.default));
+    if (css) {
+      result.forward.push(css.forward);
+      result.inverse.push(css.inverse);
+    }
+  }
+  return result;
+}
+
+function handleUpdateVariableDeclaration(
+  parsed: ParsedDocument,
+  id: string,
+  declaration: CompositionVariable,
+): MutationResult {
+  const declEl = declarationElement(parsed.document, parsed.wrapped, id);
+  if (!declEl) return EMPTY;
+  if (!isCompositionVariable(declaration) || declaration.id !== id) return EMPTY;
+  const old = findVariableDeclaration(declEl, id);
+  if (old === undefined) return EMPTY;
+  writeVariableDeclaration(declEl, declaration);
+  const p = valueChange(variableDeclPath(id), old, declaration);
+  const result: MutationResult = { forward: [p.forward], inverse: [p.inverse] };
+
+  // Default changed → keep the CSS compat prop in sync (set for scalars,
+  // clear when the new default is object-valued font/image), and emit the
+  // paired /variables value patch so the T3 override-set's var.{id} entry
+  // agrees with the varDecl.{id} snapshot regardless of replay order.
+  const oldDefault = old.default;
+  const newDefault = declaration.default;
+  if (JSON.stringify(oldDefault) !== JSON.stringify(newDefault)) {
+    const valueP = valueChange(variablePath(id), oldDefault ?? null, newDefault);
+    result.forward.push(valueP.forward);
+    result.inverse.push(valueP.inverse);
+    const css = cssCompatChange(parsed, id, isScalar(newDefault) ? String(newDefault) : null);
+    if (css) {
+      result.forward.push(css.forward);
+      result.inverse.push(css.inverse);
+    }
+  }
+  return result;
+}
+
+function handleRemoveVariableDeclaration(parsed: ParsedDocument, id: string): MutationResult {
+  const declEl = declarationElement(parsed.document, parsed.wrapped, id);
+  if (!declEl) return EMPTY;
+  const old = findVariableDeclaration(declEl, id);
+  if (old === undefined) return EMPTY;
+  removeVariableDeclarationEntry(declEl, id);
+  const path = variableDeclPath(id);
+  const result: MutationResult = {
+    forward: [patchRemove(path)],
+    inverse: [patchAdd(path, old)],
+  };
+  const css = cssCompatChange(parsed, id, null);
+  if (css) {
+    result.forward.push(css.forward);
+    result.inverse.push(css.inverse);
+  }
+  return result;
 }
 
 // ─── GSAP selector helpers ───────────────────────────────────────────────────
@@ -1383,7 +1711,7 @@ function gsapAnimationMissing(parsed: ParsedDocument, animationId: string): CanR
     : canErr(
         "E_TARGET_NOT_FOUND",
         `No GSAP animation found with id "${animationId}".`,
-        "Animation ids are positional and shift after edits — re-read them from comp before dispatching.",
+        "Animation ids are positional and shift after edits. Re-read them from comp before dispatching.",
       );
 }
 
@@ -1420,6 +1748,7 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
     case "removeElement": {
       const ids = targets(op.target);
       if (ids.length === 0) return canErr("E_TARGET_NOT_FOUND", "No target ids provided.");
+      // fallow-ignore-next-line code-duplication
       const missing = ids.filter((id) => resolveScoped(parsed.document, id) === null);
       if (missing.length > 0)
         return canErr(
@@ -1427,7 +1756,11 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
           `Element(s) not found: ${missing.join(", ")}.`,
           "Verify the id against comp.getElements() or comp.find().",
         );
-      return CAN_OK;
+      const refusal =
+        op.type === "setTiming" && op.linked !== false
+          ? planLinkedTiming(parsed, ids, op).refusal
+          : null;
+      return refusal ? canErr("E_LINKED_PARTNER_CROSSED", refusal) : CAN_OK;
     }
     case "addElement": {
       if (op.parent !== null && resolveScoped(parsed.document, op.parent) === null)
@@ -1455,6 +1788,7 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
     }
     case "reorderElements": {
       if (op.entries.length === 0) return CAN_OK;
+      // fallow-ignore-next-line code-duplication
       const missing = op.entries
         .map((e) => e.target)
         .filter((id) => resolveScoped(parsed.document, id) === null);
@@ -1467,9 +1801,64 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
       return CAN_OK;
     }
     case "setVariableValue":
+    case "removeVariable":
       if (findRoot(parsed.document) === null)
         return canErr("E_NO_ROOT", "Composition root element not found.");
       return CAN_OK;
+    case "declareVariable": {
+      const preErr = declarationPreconditionErr(parsed, op.declaration);
+      if (preErr) return preErr;
+      if (
+        findVariableDeclaration(
+          declarationElement(parsed.document, parsed.wrapped, op.declaration.id),
+          op.declaration.id,
+        ) !== undefined
+      )
+        return canErr(
+          "E_DUPLICATE_VARIABLE",
+          `Variable "${op.declaration.id}" is already declared.`,
+          "Use updateVariableDeclaration to change it, or setVariableValue to change its default.",
+        );
+      return CAN_OK;
+    }
+    case "updateVariableDeclaration": {
+      const preErr = declarationPreconditionErr(parsed, op.declaration);
+      if (preErr) return preErr;
+      if (op.declaration.id !== op.id)
+        return canErr(
+          "E_INVALID_ARGS",
+          `declaration.id ("${op.declaration.id}") must match id ("${op.id}").`,
+          "Variable ids are immutable. Rename via removeVariableDeclaration + declareVariable.",
+        );
+      if (
+        findVariableDeclaration(
+          declarationElement(parsed.document, parsed.wrapped, op.id),
+          op.id,
+        ) === undefined
+      )
+        return canErr(
+          "E_VARIABLE_NOT_FOUND",
+          `Variable "${op.id}" is not declared.`,
+          "Check comp.getVariableDeclarations(), or add it with declareVariable.",
+        );
+      return CAN_OK;
+    }
+    case "removeVariableDeclaration": {
+      const fragmentErr = fragmentCompositionErr(parsed);
+      if (fragmentErr) return fragmentErr;
+      if (
+        findVariableDeclaration(
+          declarationElement(parsed.document, parsed.wrapped, op.id),
+          op.id,
+        ) === undefined
+      )
+        return canErr(
+          "E_VARIABLE_NOT_FOUND",
+          `Variable "${op.id}" is not declared.`,
+          "Check comp.getVariableDeclarations().",
+        );
+      return CAN_OK;
+    }
     case "setCompositionMetadata":
     case "setClassStyle":
       return CAN_OK;

@@ -5,6 +5,7 @@ import {
   STUDIO_HEIGHT_PROP,
   STUDIO_MANUAL_EDIT_GESTURE_ATTR,
 } from "./draftMarkers.js";
+import { readClipTiming } from "@hyperframes/core/composition-contract";
 
 export type DraftPayload =
   | { type: "move"; hfId: string; dx: number; dy: number }
@@ -138,17 +139,37 @@ export function createPreviewAdapter(
     },
 
     getElementTimings() {
+      const timingCache = new Map<Element, { start: number | null; end: number | null }>();
+      const visiting = new Set<Element>();
+      const resolveTiming = (el: Element): { start: number | null; end: number | null } => {
+        const cached = timingCache.get(el);
+        if (cached) return cached;
+        if (visiting.has(el)) return { start: null, end: null };
+        visiting.add(el);
+        try {
+          const timing = readClipTiming(el, {
+            defaultStart: null,
+            resolveReferenceEnd: (refId) => {
+              const target = findById(refId);
+              return target ? resolveTiming(target).end : null;
+            },
+          });
+          const resolved = { start: timing.start, end: timing.end };
+          timingCache.set(el, resolved);
+          return resolved;
+        } finally {
+          visiting.delete(el);
+        }
+      };
+
       const result: Record<string, { start?: number; end?: number }> = {};
       for (const el of doc.querySelectorAll("[data-hf-id]")) {
         const hfId = el.getAttribute("data-hf-id");
         if (!hfId) continue;
-        const s = el.getAttribute("data-start");
-        const e = el.getAttribute("data-end");
-        const sv = s !== null ? parseFloat(s) : NaN;
-        const ev = e !== null ? parseFloat(e) : NaN;
+        const timing = resolveTiming(el);
         result[hfId] = {
-          start: Number.isFinite(sv) ? sv : undefined,
-          end: Number.isFinite(ev) ? ev : undefined,
+          start: timing.start ?? undefined,
+          end: timing.end ?? undefined,
         };
       }
       return result;

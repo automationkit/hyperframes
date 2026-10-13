@@ -1,5 +1,6 @@
 import type { RuntimeDeterministicAdapter } from "../types";
 import { swallow } from "../diagnostics";
+import { holdAnimationAt } from "./_holdAnimationAt";
 
 export function createWaapiAdapter(): RuntimeDeterministicAdapter {
   let didDiscover = false;
@@ -22,10 +23,10 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
     }
   >();
 
-  const snapshotAnimations = () => {
+  const snapshotAnimations = (read = () => document.getAnimations()) => {
     if (!document.getAnimations) return [];
     try {
-      return document.getAnimations();
+      return read();
     } catch {
       return [];
     }
@@ -100,7 +101,7 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
         value: original,
         configurable: true,
       });
-      const wrappedAnimate = function (...args: Parameters<Element["animate"]>) {
+      const wrappedAnimate = function (this: Element, ...args: Parameters<Element["animate"]>) {
         const animation = original.apply(this, args);
         trackAnimation(animation, lastSeekTimeMs);
         return animation;
@@ -126,7 +127,7 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
   const inferAnimationEndSeconds = (
     animation: Animation,
   ): { endSeconds?: number; unbounded?: true } => {
-    let timing: { endTime?: number | string } | null = null;
+    let timing: ComputedEffectTiming | null = null;
     try {
       timing = animation.effect?.getComputedTiming?.() ?? null;
     } catch (err) {
@@ -154,7 +155,7 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
       // After an empty discover, skip the per-frame global scan until authored
       // code creates a WAAPI animation via Element.animate (hooked above).
       if (!didDiscover || animations.size > 0) {
-        trackAnimations(snapshotAnimations(), didDiscover ? timeMs : 0);
+        trackAnimations(snapshotAnimations(ctx.pageAnimations), didDiscover ? timeMs : 0);
       }
       for (const animation of animations) {
         const baseline = didDiscover
@@ -162,23 +163,17 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
           : ensureBaseline(animation, 0);
         const localTimeMs =
           baseline.animationTimeMs + Math.max(0, timeMs - baseline.compositionTimeMs);
-        try {
-          animation.currentTime = localTimeMs;
-        } catch (err) {
-          // ignore animations that reject currentTime writes
-          swallow("runtime.adapters.waapi.site1", err);
-        }
-        try {
-          animation.pause();
-        } catch (err) {
-          // infinite unresolved animations can throw here until currentTime resolves
-          swallow("runtime.adapters.waapi.site2", err);
-        }
+        holdAnimationAt(
+          animation,
+          localTimeMs,
+          "runtime.adapters.waapi.site1",
+          "runtime.adapters.waapi.site2",
+        );
       }
     },
-    pause: () => {
+    pause: (ctx) => {
       if (!didDiscover) {
-        trackAnimations(snapshotAnimations(), lastSeekTimeMs);
+        trackAnimations(snapshotAnimations(ctx?.pageAnimations), lastSeekTimeMs);
       }
       for (const animation of animations) {
         try {

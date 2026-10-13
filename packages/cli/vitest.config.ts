@@ -1,9 +1,34 @@
-import { resolve } from "node:path";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { defineConfig } from "vitest/config";
+// Before workers fork, as below: the test run gets a home folder of its own.
+import "./scripts/test-home.mjs";
+
+// Windows: sharp's first text render builds Fontconfig's cache for every OS font (about 9 s on a
+// fresh runner). Set here, before workers fork, because an in-process env write never reaches it.
+if (process.platform === "win32") {
+  const dir = mkdtempSync(join(tmpdir(), "hf-vitest-fontconfig-"));
+  process.once("exit", () => rmSync(dir, { recursive: true, force: true }));
+  copyFileSync(
+    join(process.env.WINDIR ?? "C:\\Windows", "Fonts", "arial.ttf"),
+    join(dir, "arial.ttf"),
+  );
+  const file = join(dir, "fonts.conf");
+  writeFileSync(
+    file,
+    `<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig><dir>${dir}</dir><cachedir>${dir}</cachedir></fontconfig>`,
+  );
+  process.env.FONTCONFIG_FILE = file;
+}
 
 export default defineConfig({
   resolve: {
     alias: [
+      {
+        find: /^@hyperframes\/studio-server\/history$/,
+        replacement: resolve(__dirname, "../studio-server/src/history/index.ts"),
+      },
       // Resolve the bare @hyperframes/core entry to TypeScript source, not built
       // dist. The published dist intentionally omits runtime/entry.ts, so the
       // dist build of loadHyperframeRuntimeSource() returns null — which makes
@@ -13,6 +38,15 @@ export default defineConfig({
       {
         find: /^@hyperframes\/core$/,
         replacement: resolve(__dirname, "../core/src/index.ts"),
+      },
+      // Same reason the tsup build aliases this specifier to source: the CLI
+      // bundles the producer rather than depending on it at runtime, so its
+      // dist is not built for the test job. Without the alias, vite's import
+      // analysis resolves studioServer.ts's `import("@hyperframes/producer")`
+      // against an unbuilt package and the whole suite fails to collect.
+      {
+        find: /^@hyperframes\/producer$/,
+        replacement: resolve(__dirname, "../producer/src/index.ts"),
       },
     ],
   },

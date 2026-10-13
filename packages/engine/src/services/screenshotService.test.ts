@@ -1,14 +1,30 @@
 // @vitest-environment node
+// fallow-ignore-file code-duplication
 import { describe, it, expect, vi } from "vitest";
 import { parseHTML } from "linkedom";
 import { type Page } from "puppeteer-core";
 import {
   pageScreenshotCapture,
+  pageContentExceedsCaptureHeight,
   cdpSessionCache,
+  ensureRenderFrameSiblings,
+  applyDomLayerMask,
+  removeDomLayerMask,
   injectVideoFramesBatch,
   syncVideoFrameVisibility,
   shouldDefaultCaptureBeyondViewport,
+  initTransparentBackground,
+  DOM_LAYER_MASK_STYLE_ID,
 } from "./screenshotService.js";
+
+// These DOM tests isolate layout/decode from the CDP transport, exercised in Chrome separately.
+vi.mock("./videoFrameTransport.js", () => ({
+  withVideoFrameSources: async (
+    _page: Page,
+    updates: Array<{ videoId: string; dataUri: string }>,
+    inject: (resolved: Array<{ videoId: string; dataUri: string }>) => Promise<string[]>,
+  ) => inject(updates),
+}));
 
 // Stub a Page + CDPSession just enough that pageScreenshotCapture can call
 // `client.send("Page.captureScreenshot", ...)` and we can inspect the args.
@@ -138,15 +154,161 @@ describe("shouldDefaultCaptureBeyondViewport", () => {
   });
 });
 
+describe("pageContentExceedsCaptureHeight", () => {
+  function makeFakePageWithScrollHeight(scrollHeight: number): Page {
+    return { evaluate: vi.fn().mockResolvedValue(scrollHeight) } as unknown as Page;
+  }
+
+  it("is false when the page fits exactly within the requested height", async () => {
+    const page = makeFakePageWithScrollHeight(1920);
+    await expect(pageContentExceedsCaptureHeight(page, 1920)).resolves.toBe(false);
+  });
+
+  it("tolerates subpixel rounding just past the requested height", async () => {
+    const page = makeFakePageWithScrollHeight(1920.5);
+    await expect(pageContentExceedsCaptureHeight(page, 1920)).resolves.toBe(false);
+  });
+
+  it("tolerates exactly one CSS pixel past the requested height", async () => {
+    const page = makeFakePageWithScrollHeight(1921);
+    await expect(pageContentExceedsCaptureHeight(page, 1920)).resolves.toBe(false);
+  });
+
+  it("detects content just beyond the rounding tolerance", async () => {
+    const page = makeFakePageWithScrollHeight(1922);
+    await expect(pageContentExceedsCaptureHeight(page, 1920)).resolves.toBe(true);
+  });
+
+  it("is true when the page genuinely overflows the requested height", async () => {
+    const page = makeFakePageWithScrollHeight(2007);
+    await expect(pageContentExceedsCaptureHeight(page, 1920)).resolves.toBe(true);
+  });
+});
+
+describe("initTransparentBackground", () => {
+  // evaluate() runs against a linkedom document in globalThis; the cached CDP stub skips createCDPSession().
+  function makeFakePageWithDom() {
+    const { document } = parseHTML("<html><body></body></html>");
+    const send = vi.fn().mockResolvedValue({});
+    const fakeSession = { send } as unknown as import("puppeteer-core").CDPSession;
+    const fakePage = {
+      evaluate: async (fn: (...args: never[]) => void, ...args: never[]) => fn(...args),
+    } as unknown as Page;
+    cdpSessionCache.set(fakePage, fakeSession);
+    const globals = globalThis as unknown as { document?: Document };
+    const previousDocument = globals.document;
+    globals.document = document;
+    return {
+      page: fakePage,
+      document,
+      send,
+      restore: () => {
+        globals.document = previousDocument;
+      },
+    };
+  }
+
+  it("clears only html/body when clearCompositionRoot is false — an authored composition-root background must survive", async () => {
+    const { page, document, send, restore } = makeFakePageWithDom();
+    try {
+      await initTransparentBackground(page, { clearCompositionRoot: false });
+      const style = document.getElementById("__hf_transparent_bg__");
+      expect(style?.textContent).toContain("html,body{");
+      expect(style?.textContent).not.toContain("[data-composition-id]");
+      expect(send).toHaveBeenCalledWith("Emulation.setDefaultBackgroundColorOverride", {
+        color: { r: 0, g: 0, b: 0, a: 0 },
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("also clears the composition root when clearCompositionRoot is true (HDR layered DOM pass)", async () => {
+    const { page, document, restore } = makeFakePageWithDom();
+    try {
+      await initTransparentBackground(page, { clearCompositionRoot: true });
+      const style = document.getElementById("__hf_transparent_bg__");
+      expect(style?.textContent).toContain("[data-composition-id]");
+    } finally {
+      restore();
+    }
+  });
+
+  it("a later call replaces the earlier call's rule instead of no-op'ing on the existing style element", async () => {
+    const { page, document, restore } = makeFakePageWithDom();
+    try {
+      await initTransparentBackground(page, { clearCompositionRoot: false });
+      await initTransparentBackground(page, { clearCompositionRoot: true });
+      expect(document.querySelectorAll('style[id="__hf_transparent_bg__"]').length).toBe(1);
+      expect(document.getElementById("__hf_transparent_bg__")?.textContent).toContain(
+        "[data-composition-id]",
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("injectVideoFramesBatch load failures", () => {
+  it("rejects naming the video when an injected frame fails to decode", async () => {
+    const { window, document } = parseHTML(
+      '<html><body><div id="root"><video id="clip" style="position:absolute;width:100%;height:100%"></video></div></body></html>',
+    );
+    Object.defineProperty(window.HTMLImageElement.prototype, "decode", {
+      configurable: true,
+      value: async () => {
+        throw new Error("The source image cannot be decoded.");
+      },
+    });
+    const video = document.getElementById("clip") as HTMLVideoElement;
+    video.getBoundingClientRect = () => ({ width: 1920, height: 1080 }) as DOMRect;
+    const computedStyle = document.createElement("div").style;
+    computedStyle.opacity = "1";
+    Object.defineProperty(window, "getComputedStyle", {
+      configurable: true,
+      value: () => computedStyle,
+    });
+    const globals = globalThis as unknown as { window?: typeof window; document?: Document };
+    const previousWindow = globals.window;
+    const previousDocument = globals.document;
+    globals.window = window;
+    globals.document = document;
+    try {
+      const page = {
+        evaluate: async (
+          fn: (
+            updates: Array<{ videoId: string; dataUri: string }>,
+            visualProperties: string[],
+          ) => Promise<void>,
+          updates: Array<{ videoId: string; dataUri: string }>,
+          visualProperties: string[],
+        ) => fn(updates, visualProperties),
+      } as unknown as Page;
+
+      await expect(
+        injectVideoFramesBatch(page, [{ videoId: "clip", dataUri: "data:image/jpeg;base64,AAAA" }]),
+      ).rejects.toThrow(
+        'Video frame for "clip" failed to load (inline frame): The source image cannot be decoded.',
+      );
+    } finally {
+      globals.window = previousWindow;
+      globals.document = previousDocument;
+    }
+  });
+});
+
 describe("injectVideoFramesBatch replacement layout", () => {
   it("does not copy opposing inset constraints onto the injected frame image", async () => {
     const { window, document } = parseHTML(
       '<html><body><div id="root"><video id="clip" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></video></div></body></html>',
     );
 
+    const events: string[] = [];
     Object.defineProperty(window.HTMLImageElement.prototype, "decode", {
       configurable: true,
-      value: () => Promise.resolve(),
+      value: async () => {
+        events.push("decode");
+      },
     });
 
     const video = document.getElementById("clip") as HTMLVideoElement;
@@ -195,6 +357,10 @@ describe("injectVideoFramesBatch replacement layout", () => {
     const previousDocument = globals.document;
     globals.window = window;
     globals.document = document;
+    const redraw = vi.fn(() => events.push("redraw"));
+    (window as unknown as { __hf: { colorGrading: { redraw: () => void } } }).__hf = {
+      colorGrading: { redraw },
+    };
     try {
       const page = {
         evaluate: async (
@@ -229,6 +395,8 @@ describe("injectVideoFramesBatch replacement layout", () => {
     expect(img?.style.right).toBe("auto");
     expect(img?.style.bottom).toBe("auto");
     expect(img?.style.inset).toBe("auto");
+    expect(redraw).toHaveBeenCalledOnce();
+    expect(events).toEqual(["decode", "redraw"]);
   });
 });
 
@@ -266,7 +434,7 @@ describe("video-frame injection respects ancestor visibility", () => {
 
   function setupHostHiddenScenario(
     hostStyle: StyleLike,
-    options: { hostAttribute?: HostAttribute } = {},
+    options: { hostAttribute?: HostAttribute; videoStyle?: StyleLike } = {},
   ) {
     const hostAttribute = options.hostAttribute ?? "data-composition-src";
     const hostAttrMarkup =
@@ -308,7 +476,13 @@ describe("video-frame injection respects ancestor visibility", () => {
     const styles = new Map<Element, StyleLike>();
     styles.set(host, hostStyle);
     styles.set(pipFrame, {});
-    styles.set(video, { opacity: "1", objectFit: "cover", objectPosition: "center", zIndex: "1" });
+    styles.set(video, {
+      opacity: "1",
+      objectFit: "cover",
+      objectPosition: "center",
+      zIndex: "1",
+      ...options.videoStyle,
+    });
 
     Object.defineProperty(window, "getComputedStyle", {
       configurable: true,
@@ -359,6 +533,29 @@ describe("video-frame injection respects ancestor visibility", () => {
         // execute the function body directly in Node.
         Promise.resolve((fn as (...a: unknown[]) => unknown)(...args)),
     } as unknown as Page;
+  }
+
+  function installDomMaskGlobals(setup: { window: Window; document: Document }): () => void {
+    const globals = globalThis as unknown as {
+      window?: Window;
+      document?: Document;
+      HTMLElement?: typeof HTMLElement;
+      CSS?: typeof CSS;
+    };
+    const previousWindow = globals.window;
+    const previousDocument = globals.document;
+    const previousHTMLElement = globals.HTMLElement;
+    const previousCSS = globals.CSS;
+    globals.window = setup.window;
+    globals.document = setup.document;
+    globals.HTMLElement = setup.window.HTMLElement;
+    globals.CSS = { escape: (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "\\$&") } as CSS;
+    return () => {
+      globals.window = previousWindow;
+      globals.document = previousDocument;
+      globals.HTMLElement = previousHTMLElement;
+      globals.CSS = previousCSS;
+    };
   }
 
   it("skips replacement-frame creation when the video's host has visibility:hidden", async () => {
@@ -443,6 +640,23 @@ describe("video-frame injection respects ancestor visibility", () => {
     expect(seededImg.style.visibility).toBe("hidden");
   });
 
+  it("preserves display:none on an inactive in-flow video so its sibling keeps the same box", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({}));
+    setup.video.style.display = "none";
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+
+    try {
+      await syncVideoFrameVisibility(passthroughPage(), []);
+    } finally {
+      teardown();
+    }
+
+    expect(setup.video.style.display).toBe("none");
+    expect(seededImg.style.visibility).toBe("hidden");
+  });
+
   it("still injects when a plain [data-start] host is visibility:hidden (CSS-escapable)", async () => {
     // Regression guard for the style-9-prod symptom: a regular
     // `[data-start]` container whose GSAP timeline is shorter than its
@@ -471,6 +685,52 @@ describe("video-frame injection respects ancestor visibility", () => {
     expect(sibling).not.toBeNull();
     expect(sibling?.classList.contains("__render_frame__")).toBe(true);
     expect(sibling?.style.visibility).toBe("visible");
+  });
+
+  it("does not copy color-grading source suppression opacity to the injected frame", async () => {
+    const { teardown, setup } = withGlobals(
+      setupHostHiddenScenario({}, { videoStyle: { opacity: "0" } }),
+    );
+    setup.video.setAttribute("data-hf-color-grading-source-hidden", "true");
+
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    const sibling = setup.video.nextElementSibling as HTMLElement | null;
+    expect(sibling?.classList.contains("__render_frame__")).toBe(true);
+    expect(sibling?.style.opacity).toBe("1");
+  });
+
+  it("repairs stale injected-frame opacity while syncing color-graded active videos", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({}));
+    setup.video.setAttribute("data-hf-color-grading-source-hidden", "true");
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.opacity = "0";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+    const setSourceVisibility = vi.fn();
+    (setup.window as unknown as { __hf: unknown }).__hf = {
+      colorGrading: { setSourceVisibility },
+    };
+
+    try {
+      await syncVideoFrameVisibility(passthroughPage(), ["pip"]);
+    } finally {
+      teardown();
+    }
+
+    expect(seededImg.style.opacity).toBe("1");
+    expect(seededImg.style.visibility).toBe("visible");
+    expect(setSourceVisibility).toHaveBeenCalledWith(setup.video, true);
   });
 
   it("syncVideoFrameVisibility shows the replacement <img> when a plain [data-start] host is visibility:hidden", async () => {
@@ -536,6 +796,10 @@ describe("video-frame injection respects ancestor visibility", () => {
     seededImg.style.visibility = "visible";
     setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
     const setPropertySpy = vi.spyOn(seededImg.style, "setProperty");
+    const setSourceVisibility = vi.fn();
+    (setup.window as unknown as { __hf: unknown }).__hf = {
+      colorGrading: { setSourceVisibility },
+    };
 
     try {
       await syncVideoFrameVisibility(passthroughPage(), ["pip"]);
@@ -545,5 +809,216 @@ describe("video-frame injection respects ancestor visibility", () => {
 
     expect(seededImg.style.visibility).toBe("hidden");
     expect(setPropertySpy).toHaveBeenCalledWith("visibility", "hidden", "important");
+    expect(setSourceVisibility).toHaveBeenCalledWith(setup.video, false);
+  });
+
+  it("applyDomLayerMask does not revive hidden idless timed descendants of a shown layer", async () => {
+    const { window, document } = parseHTML(
+      `<html><head></head><body>
+        <div id="scene" data-start="0" data-duration="6">
+          <div class="label" data-start="4.5" data-duration="1.5">late label</div>
+        </div>
+      </body></html>`,
+    );
+    const scene = document.getElementById("scene") as HTMLElement;
+    const label = document.querySelector(".label") as HTMLElement;
+    label.style.visibility = "hidden";
+
+    Object.defineProperty(window, "getComputedStyle", {
+      configurable: true,
+      value: (el: Element) => ({
+        display: (el as HTMLElement).style.display || "block",
+        visibility: (el as HTMLElement).style.visibility || "visible",
+      }),
+    });
+
+    const teardown = installDomMaskGlobals({ window, document });
+    try {
+      await applyDomLayerMask(passthroughPage(), ["scene"], []);
+      expect(scene.style.visibility || "").toBe("");
+      expect(label.style.visibility).toBe("hidden");
+
+      await removeDomLayerMask(passthroughPage(), []);
+      expect(label.style.visibility).toBe("hidden");
+      expect(label.hasAttribute("data-hf-dom-layer-mask-hidden")).toBe(false);
+    } finally {
+      teardown();
+    }
+  });
+
+  it("removeDomLayerMask keeps hidden timed descendants hidden when they are also extraHideIds", async () => {
+    const { window, document } = parseHTML(
+      `<html><head></head><body>
+        <div id="scene" data-start="0" data-duration="6">
+          <div id="caption" data-start="4.5" data-duration="1.5">late label</div>
+        </div>
+      </body></html>`,
+    );
+    const caption = document.getElementById("caption") as HTMLElement;
+    caption.style.visibility = "hidden";
+
+    Object.defineProperty(window, "getComputedStyle", {
+      configurable: true,
+      value: (el: Element) => ({
+        display: (el as HTMLElement).style.display || "block",
+        visibility: (el as HTMLElement).style.visibility || "visible",
+      }),
+    });
+
+    const teardown = installDomMaskGlobals({ window, document });
+    try {
+      await applyDomLayerMask(passthroughPage(), ["scene"], ["caption"]);
+      await removeDomLayerMask(passthroughPage(), ["caption"]);
+
+      expect(caption.style.visibility).toBe("hidden");
+      expect(caption.hasAttribute("data-hf-dom-layer-mask-hidden")).toBe(false);
+    } finally {
+      teardown();
+    }
+  });
+
+  it("removeDomLayerMask restores extraHideIds and render frames to previous visibility", async () => {
+    const { window, document } = parseHTML(
+      `<html><head></head><body>
+        <div id="visible-caption" data-start="0" data-duration="1">current</div>
+        <video id="clip" data-start="0" data-duration="1"></video>
+        <img id="__render_frame_clip__" />
+      </body></html>`,
+    );
+    const visibleCaption = document.getElementById("visible-caption") as HTMLElement;
+    const clip = document.getElementById("clip") as HTMLElement;
+    const renderFrame = document.getElementById("__render_frame_clip__") as HTMLElement;
+    visibleCaption.style.visibility = "visible";
+    clip.style.visibility = "hidden";
+    renderFrame.style.setProperty("visibility", "hidden", "important");
+
+    Object.defineProperty(window, "getComputedStyle", {
+      configurable: true,
+      value: (el: Element) => ({
+        display: (el as HTMLElement).style.display || "block",
+        visibility: (el as HTMLElement).style.visibility || "visible",
+      }),
+    });
+
+    const teardown = installDomMaskGlobals({ window, document });
+    try {
+      await applyDomLayerMask(passthroughPage(), [], ["visible-caption", "clip"]);
+      await removeDomLayerMask(passthroughPage(), ["visible-caption", "clip"]);
+
+      expect(visibleCaption.style.visibility).toBe("visible");
+      expect(clip.style.visibility).toBe("hidden");
+      expect(renderFrame.style.visibility).toBe("hidden");
+    } finally {
+      teardown();
+    }
+  });
+
+  it("applyDomLayerMask carries color grading canvases with their media element", async () => {
+    const { window, document } = parseHTML(
+      '<html><head></head><body><div id="root"><video id="pip"></video><canvas id="__hf_color_grading_pip"></canvas></div></body></html>',
+    );
+    const teardown = installDomMaskGlobals({ window, document });
+    try {
+      await applyDomLayerMask(passthroughPage(), ["pip"], []);
+      expect(document.getElementById(DOM_LAYER_MASK_STYLE_ID)?.textContent).toContain(
+        "#__hf_color_grading_pip",
+      );
+
+      await applyDomLayerMask(passthroughPage(), ["root"], ["pip"]);
+      const canvas = document.getElementById("__hf_color_grading_pip") as HTMLCanvasElement;
+      expect(canvas.style.visibility).toBe("hidden");
+
+      await removeDomLayerMask(passthroughPage(), ["pip"]);
+      expect(canvas.style.getPropertyValue("visibility") || "").toBe("");
+    } finally {
+      teardown();
+    }
+  });
+});
+
+describe("ensureRenderFrameSiblings", () => {
+  function passthroughPage(): Page {
+    return {
+      evaluate: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+        Promise.resolve((fn as (...a: unknown[]) => unknown)(...args)),
+    } as unknown as Page;
+  }
+
+  function withGlobalDom(setup: { window: Window; document: Document }): { teardown: () => void } {
+    const globals = globalThis as unknown as { window?: Window; document?: Document };
+    const previousWindow = globals.window;
+    const previousDocument = globals.document;
+    globals.window = setup.window;
+    globals.document = setup.document;
+    return {
+      teardown: () => {
+        globals.window = previousWindow;
+        globals.document = previousDocument;
+      },
+    };
+  }
+
+  it("creates a hidden __render_frame__ sibling for every video[data-start]", async () => {
+    const { window, document } = parseHTML(
+      `<html><body>
+        <div id="root">
+          <video id="v1" data-start="0" data-duration="2"></video>
+          <video id="v2" data-start="2" data-duration="2"></video>
+        </div>
+      </body></html>`,
+    );
+    const { teardown } = withGlobalDom({ window, document });
+    try {
+      await ensureRenderFrameSiblings(passthroughPage());
+    } finally {
+      teardown();
+    }
+
+    for (const id of ["v1", "v2"]) {
+      const video = document.getElementById(id) as HTMLVideoElement;
+      const sibling = video.nextElementSibling as HTMLElement | null;
+      expect(sibling).not.toBeNull();
+      expect(sibling?.tagName.toLowerCase()).toBe("img");
+      expect(sibling?.classList.contains("__render_frame__")).toBe(true);
+      expect(sibling?.id).toBe(`__render_frame_${id}__`);
+      expect(sibling?.style.visibility).toBe("hidden");
+    }
+  });
+
+  it("skips videos that already have a __render_frame__ sibling", async () => {
+    const { window, document } = parseHTML(
+      `<html><body>
+        <div id="root">
+          <video id="clip" data-start="0" data-duration="2"></video>
+          <img id="__render_frame_clip__" class="__render_frame__">
+        </div>
+      </body></html>`,
+    );
+    const preExisting = document.getElementById("__render_frame_clip__") as HTMLImageElement;
+    const { teardown } = withGlobalDom({ window, document });
+    try {
+      await ensureRenderFrameSiblings(passthroughPage());
+    } finally {
+      teardown();
+    }
+
+    const video = document.getElementById("clip") as HTMLVideoElement;
+    expect(video.nextElementSibling).toBe(preExisting);
+    expect(document.querySelectorAll(".__render_frame__").length).toBe(1);
+  });
+
+  it("does not touch <video> elements without data-start", async () => {
+    const { window, document } = parseHTML(
+      `<html><body><div id="root"><video id="raw"></video></div></body></html>`,
+    );
+    const { teardown } = withGlobalDom({ window, document });
+    try {
+      await ensureRenderFrameSiblings(passthroughPage());
+    } finally {
+      teardown();
+    }
+
+    const video = document.getElementById("raw") as HTMLVideoElement;
+    expect(video.nextElementSibling).toBeNull();
   });
 });

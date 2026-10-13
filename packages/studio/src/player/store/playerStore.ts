@@ -1,84 +1,97 @@
 import { create } from "zustand";
+import { attachPlayerStoreDevHandle } from "./playerStoreDevHandle";
+import { nextSelectionSet, revealTargetsSelection } from "./playerStoreSelection";
 import type { MusicBeatAnalysis } from "@hyperframes/core/beats";
 import type { BeatEditState } from "../../utils/beatEditing";
 import type { ClipManifestClip } from "../lib/playbackTypes";
-import { readStudioUiPreferences, writeStudioUiPreferences } from "../../utils/studioUiPreferences";
+import {
+  readStudioUiPreferences,
+  writeStudioUiPreferences,
+  type TimelineTimeDisplayMode,
+} from "../../utils/studioUiPreferences";
+import { clampTimelineZoomPercent, computePinnedZoomPercent } from "../components/timelineZoom";
+import { createKeyframeSlice, type KeyframeSlice } from "./keyframeSlice";
+import {
+  createAutomationSelectionSlice,
+  type AutomationSelectionSlice,
+} from "./automationSelectionSlice";
+import { createEditingModeSlice, type EditingModeSlice } from "./editingModeSlice";
+import { createTimelineFocusRequest, type TimelineFocusRequest } from "./timelineFocusState";
+import { createThumbnailSlice, type ThumbnailSlice } from "./thumbnailSlice";
+import { createPlaybackReadinessSlice } from "./readinessSlice";
+import { createRangeSelectionSlice, type RangeSelectionSlice } from "./rangeSelectionSlice";
+import { createTimelineResetState } from "./timelineResetState";
+import { patchElements, queueElementPatch } from "./elementPatchQueue";
+export type { KeyframeCacheEntry } from "./keyframeSlice";
+export { liveTime } from "./liveTime";
+import { liveTime } from "./liveTime";
+export { createTimelineResetState };
 
-/** Minimal keyframe cache types — mirrors GsapKeyframesData without pulling in Node-only gsap-parser. */
-export interface KeyframeCacheEntry {
-  format: string;
-  keyframes: Array<{
-    percentage: number;
-    /** Original tween-relative percentage (server mutations need this, not the clip-relative `percentage`). */
-    tweenPercentage?: number;
-    /** Which property group the source tween belongs to (position, scale, rotation, visual, etc.). */
-    propertyGroup?: string;
-    properties: Record<string, number | string>;
-    ease?: string;
-  }>;
-  ease?: string;
-  easeEach?: string;
-}
+import type {
+  TimelineElement,
+  TimelineElementPatch,
+  SubCompositionHostState,
+} from "./timelineElement";
 
-export interface TimelineElement {
-  id: string;
-  label?: string;
-  key?: string;
-  tag: string;
-  start: number;
-  duration: number;
-  track: number;
-  domId?: string;
-  /** Stable `data-hf-id` attribute value — used as primary patch target when present */
-  hfId?: string;
-  /** Best-effort selector used when patching source HTML back from timeline edits */
-  selector?: string;
-  /** Zero-based occurrence index for non-unique selectors */
-  selectorIndex?: number;
-  /** Source composition file that owns this element, when known */
-  sourceFile?: string;
-  src?: string;
-  playbackStart?: number;
-  playbackStartAttr?: "media-start" | "playback-start";
-  playbackRate?: number;
-  sourceDuration?: number;
-  volume?: number;
-  /** Path from data-composition-src — identifies sub-composition elements */
-  compositionSrc?: string;
-  /** Whether this row came from authored clip timing or Studio's full-duration layer fallback. */
-  timingSource?: "authored" | "implicit";
-  /** Set by data-timeline-locked on the host element — disables move and trim in Studio. */
-  timelineLocked?: boolean;
-  /** Value of data-timeline-role attribute — used to identify music vs. voiceover. */
-  timelineRole?: string;
-  /**
-   * Set by useExpandedTimelineElements on an inline-expanded sub-composition
-   * child: the absolute master-timeline start of the sub-comp host the child
-   * lives in. Presence marks the element as expanded; edits subtract it to get
-   * the child's local (sourceFile-relative) time. Works at any nesting depth.
-   */
-  expandedParentStart?: number;
-}
-
+export type { TimelineElement, SubCompositionHostState };
 export type ZoomMode = "fit" | "manual";
 type TimelineTool = "select" | "razor";
 
-interface PlayerState {
+export interface SelectElementOptions {
+  preserveSet?: boolean;
+}
+
+function resolveElementSelection(
+  ids: Iterable<string>,
+  anchor?: string | null,
+): { selectedElementIds: Set<string>; selectedElementId: string | null } {
+  const selectedElementIds = new Set(ids);
+  if (selectedElementIds.size === 0) {
+    return { selectedElementIds, selectedElementId: null };
+  }
+  if (anchor && selectedElementIds.has(anchor)) {
+    return { selectedElementIds, selectedElementId: anchor };
+  }
+  return {
+    selectedElementIds,
+    selectedElementId: selectedElementIds.values().next().value ?? null,
+  };
+}
+
+type PlayerStoreSlices = KeyframeSlice &
+  AutomationSelectionSlice &
+  ThumbnailSlice &
+  EditingModeSlice &
+  ReturnType<typeof createPlaybackReadinessSlice> &
+  RangeSelectionSlice;
+interface PlayerState extends PlayerStoreSlices {
   isPlaying: boolean;
   currentTime: number;
   duration: number;
-  timelineReady: boolean;
+  /** Increments exactly once when the Studio switches to a different project. */
+  timelineSessionEpoch: number;
+  /** Project owning the current timeline session; null outside a project-scoped reset. */
+  timelineProjectId: string | null;
   /** True while a beat dot is being dragged — hides the playhead guideline. */
   beatDragging: boolean;
   elements: TimelineElement[];
   selectedElementId: string | null;
   playbackRate: number;
   audioMuted: boolean;
+  audioVolume: number;
   loopEnabled: boolean;
   /** Timeline zoom: 'fit' auto-scales to viewport, 'manual' uses manualZoomPercent */
   zoomMode: ZoomMode;
   /** Timeline zoom percent relative to the fit width when in manual mode */
   manualZoomPercent: number;
+  userZoomCount: number;
+  /**
+   * Bumped on every live z-index edit (handleDomZIndexReorderCommit apply AND
+   * rollback). Flashless z commits (skipReload) never reload the iframe or
+   * bump refreshKey, so DOM-derived views (the Layers panel's z-sorted tree)
+   * subscribe to this to re-read the live DOM while playback is paused.
+   */
+  zEditVersion: number;
   /** Work-area in-point (seconds). When set, loop starts here and A jumps here. */
   inPoint: number | null;
   /** Work-area out-point (seconds). When set, loop ends here and E jumps here. */
@@ -86,67 +99,91 @@ interface PlayerState {
 
   activeTool: TimelineTool;
   setActiveTool: (tool: TimelineTool) => void;
-
-  /** Set of selected keyframe keys in format `${elementId}:${percentage}`. */
-  selectedKeyframes: Set<string>;
-  toggleSelectedKeyframe: (key: string) => void;
-  clearSelectedKeyframes: () => void;
+  selectLeftward: () => void;
+  selectRightward: () => void;
 
   /** Tween-relative percentage of the last-clicked keyframe diamond. Operations
    *  (drag, resize, rotate) target this instead of recomputing from playhead. */
   activeKeyframePct: number | null;
   setActiveKeyframePct: (pct: number | null) => void;
-  /** Motion-path "set destination" mode. Armed from the preview toolbar (replaces
-   *  the old double-click-on-canvas UX); while armed, one canvas click places the
-   *  new path's destination. `available` is published by MotionPathOverlay so the
-   *  toolbar shows the button only when the selected element can take a path. */
-  motionPathArmed: boolean;
-  setMotionPathArmed: (armed: boolean) => void;
-  motionPathCreateAvailable: boolean;
-  setMotionPathCreateAvailable: (available: boolean) => void;
-  /** Global toggle for the "Add keyframe" diamond in the timeline toolbar (#1808).
-   *  When false, a manual drag/resize/rotate edit on an element that already has
-   *  a live tween shifts every keyframe by the edit's delta (preserving the
-   *  animation's shape) instead of inserting/updating a keyframe at the playhead. */
-  autoKeyframeEnabled: boolean;
-  setAutoKeyframeEnabled: (enabled: boolean) => void;
 
   /** Multi-select: additional selected elements beyond selectedElementId. */
   selectedElementIds: Set<string>;
-  toggleSelectedElementId: (id: string) => void;
   clearSelectedElementIds: () => void;
-
-  /** Keyframe data per element id, populated from parsed GSAP animations. */
-  keyframeCache: Map<string, KeyframeCacheEntry>;
-  setKeyframeCache: (elementId: string, data: KeyframeCacheEntry | undefined) => void;
+  /** Replace the whole multi-selection at once (marquee live updates). */
+  setSelectedElementIds: (ids: Set<string>) => void;
+  /** Timeline magnet toggle — when false, clip drags/trims/drops never snap. */
+  timelineSnapEnabled: boolean;
+  setTimelineSnapEnabled: (enabled: boolean) => void;
+  /** Keeps the main track gapless on delete; distinct from the magnet above. */
+  rippleEditEnabled: boolean;
+  setRippleEditEnabled: (enabled: boolean) => void;
+  /** Transport + ruler readout: timecode ("time") or frame number ("frame"). */
+  timeDisplayMode: TimelineTimeDisplayMode;
+  setTimeDisplayMode: (mode: TimelineTimeDisplayMode) => void;
+  /** Pin the timeline zoom to its current scale before a duration change, so
+   *  it stops rescaling every clip. No-op once already pinned. */
+  pinTimelineZoom: (currentPixelsPerSecond: number, fitPixelsPerSecond: number) => void;
+  /** The timeline's live pixels-per-second + fit basis, published by <Timeline>. */
+  timelinePps: number;
+  timelineFitPps: number;
+  setTimelineScale: (pps: number, fitPps: number) => void;
+  setSelection: (ids: Iterable<string>, anchor?: string | null) => void;
+  addSelectedElementId: (id: string) => void;
+  toggleSelectedElementId: (id: string) => void;
+  clearSelection: () => void;
 
   setIsPlaying: (playing: boolean) => void;
   setCurrentTime: (time: number) => void;
   setDuration: (duration: number) => void;
   setPlaybackRate: (rate: number) => void;
   setAudioMuted: (muted: boolean) => void;
+  setAudioVolume: (volume: number) => void;
   setLoopEnabled: (enabled: boolean) => void;
-  setTimelineReady: (ready: boolean) => void;
   setBeatDragging: (dragging: boolean) => void;
   setElements: (elements: TimelineElement[]) => void;
-  setSelectedElementId: (id: string | null) => void;
-  updateElement: (
-    elementId: string,
-    updates: Partial<Pick<TimelineElement, "start" | "duration" | "track" | "playbackStart">>,
-  ) => void;
+  setSelectedElementId: (id: string | null, options?: SelectElementOptions) => void;
+  /** Move the selection anchor within an active multi-selection without collapsing it. */
+  setSelectionAnchor: (id: string | null) => void;
+  updateElement: (elementId: string, updates: TimelineElementPatch) => void;
   setZoomMode: (mode: ZoomMode) => void;
   setManualZoomPercent: (percent: number) => void;
+  bumpZEditVersion: () => void;
   setInPoint: (time: number | null) => void;
   setOutPoint: (time: number | null) => void;
+  /** Owns the hard project boundary; repeated calls for one project are no-ops. */
+  beginTimelineSession: (projectId: string) => void;
+  /** Clears project data without creating a new hard-project session. */
   reset: () => void;
 
-  /**
-   * Request a seek from outside the player loop (e.g. Layers panel).
-   * useTimelinePlayer subscribes and calls adapter.seek() + liveTime.notify().
-   */
+  /** Request a seek from outside the player loop (e.g. Layers panel);
+   *  useTimelinePlayer subscribes and calls adapter.seek() + liveTime.notify(). */
   requestedSeekTime: number | null;
   requestSeek: (time: number) => void;
   clearSeekRequest: () => void;
+
+  /** Request the transport start or stop from outside the player loop: the FX
+   *  rack starts playback to audition a preset (silent while paused) and
+   *  restores the playhead on leave, without costing the author their place.
+   *  A nonce, not a bare boolean, so two hovers in a row both register. */
+  playbackRequest: { playing: boolean; returnTo: number | null; nonce: number } | null;
+  requestPlayback: (playing: boolean, returnTo?: number | null) => void;
+  clearPlaybackRequest: () => void;
+
+  /**
+   * Request the timeline to scroll a clip into view (e.g. clicking an
+   * already-added asset card in the sidebar). Consumed and cleared by
+   * useTimelineRevealClip. The nonce makes repeat requests for the same
+   * clip observable so a second click re-reveals after the user scrolls away.
+   */
+  clipRevealRequest: { elementId: string; nonce: number } | null;
+  requestClipReveal: (elementId: string) => void;
+  clearClipRevealRequest: () => void;
+
+  timelineFocus: TimelineFocusRequest | null;
+  timelineFocusNonce: number;
+  requestTimelineFocus: (id: string) => void;
+  clearTimelineFocus: (nonce: number) => void;
 
   lintFindingsByElement: Map<string, { count: number; messages: string[] }>;
   setLintFindingsByElement: (map: Map<string, { count: number; messages: string[] }>) => void;
@@ -179,6 +216,14 @@ interface PlayerState {
    */
   domClipChildren: DomClipChild[];
   setDomClipChildren: (children: DomClipChild[]) => void;
+  /**
+   * Host-element state for every id'd element inside a sub-composition, keyed by
+   * dom id. Collected from the live preview because it is the only place that
+   * sees it: these elements are filtered out of `elements` before the flat store
+   * is built, and the clip manifest carries timing, not attributes.
+   */
+  subCompositionHostState: Map<string, SubCompositionHostState>;
+  setSubCompositionHostState: (state: Map<string, SubCompositionHostState>) => void;
 }
 
 /** A sub-comp DOM-only timeline child (no data-start) and its nesting context. */
@@ -188,6 +233,20 @@ export interface DomClipChild {
   /** The manifest sub-comp host clip id this descendant ultimately lives under. */
   hostId: string;
   label: string;
+  stackingContextId: string;
+  /**
+   * The child's audio-group state, read off its live element during the DOM
+   * walk — the only place that sees it. A sub-composition can declare a group
+   * and its members entirely within itself, and those members never reach the
+   * flat store, so an expanded child has no twin to inherit membership from.
+   */
+  audioGroup?: string;
+  audioGroupLabel?: string;
+  audioGroupVolume?: number;
+  audioGroupHidden?: boolean;
+  audioGroupFxChain?: string;
+  /** The group element's `data-automation`, mirrored the same way. */
+  audioGroupAutomation?: string;
 }
 
 interface BeatHistoryEntry {
@@ -196,79 +255,110 @@ interface BeatHistoryEntry {
   label: string;
 }
 
-// Lightweight pub-sub for current time during playback.
-// Bypasses React state so the RAF loop can update the playhead/time display
-// without triggering re-renders on every frame.
-type TimeListener = (time: number) => void;
-const _timeListeners = new Set<TimeListener>();
-export const liveTime = {
-  notify: (t: number) => _timeListeners.forEach((cb) => cb(t)),
-  subscribe: (cb: TimeListener) => {
-    _timeListeners.add(cb);
-    return () => _timeListeners.delete(cb);
-  },
-};
+/** Selects like the marquee: the primary first, so its resets run, then the whole set. */
+function selectAroundPlayhead(
+  state: PlayerState,
+  keep: (el: TimelineElement, playhead: number) => boolean,
+): void {
+  const playhead = state.isPlaying ? liveTime.latest() : state.currentTime;
+  const ids = state.elements.filter((el) => keep(el, playhead)).map((el) => el.key ?? el.id);
+  state.setSelectedElementId(ids[0] ?? null);
+  state.setSelectedElementIds(new Set(ids));
+}
 
 export const usePlayerStore = create<PlayerState>((set, get) => ({
   isPlaying: false,
   currentTime: 0,
   duration: 0,
-  timelineReady: false,
+  timelineSessionEpoch: 0,
+  timelineProjectId: null,
   beatDragging: false,
   elements: [],
   selectedElementId: null,
   playbackRate: readStudioUiPreferences().playbackRate ?? 1,
   audioMuted: readStudioUiPreferences().audioMuted ?? false,
+  audioVolume: readStudioUiPreferences().audioVolume ?? 1,
   loopEnabled: false,
   zoomMode: "fit",
   manualZoomPercent: 100,
+  userZoomCount: 0,
+  zEditVersion: 0,
+  timelinePps: 100,
+  timelineFitPps: 100,
   inPoint: null,
   outPoint: null,
 
   activeTool: "select",
   setActiveTool: (tool) => set({ activeTool: tool }),
+  selectLeftward: () => selectAroundPlayhead(get(), (el, t) => el.start < t),
+  selectRightward: () => selectAroundPlayhead(get(), (el, t) => el.start + el.duration > t),
 
-  selectedKeyframes: new Set(),
-  toggleSelectedKeyframe: (key) =>
-    set((s) => {
-      const next = new Set(s.selectedKeyframes);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return { selectedKeyframes: next };
-    }),
-  clearSelectedKeyframes: () => set({ selectedKeyframes: new Set() }),
+  ...createKeyframeSlice(set, () => ({
+    timelineProjectId: get().timelineProjectId,
+    timelineSessionEpoch: get().timelineSessionEpoch,
+  })),
+  ...createThumbnailSlice(set),
+
+  ...createAutomationSelectionSlice(set),
+  ...createEditingModeSlice(set),
+  ...createRangeSelectionSlice(),
+  ...createPlaybackReadinessSlice(set),
 
   activeKeyframePct: null,
   setActiveKeyframePct: (pct) => set({ activeKeyframePct: pct }),
-  motionPathArmed: false,
-  setMotionPathArmed: (armed) => set({ motionPathArmed: armed }),
-  motionPathCreateAvailable: false,
-  setMotionPathCreateAvailable: (available) => set({ motionPathCreateAvailable: available }),
-  autoKeyframeEnabled: true,
-  setAutoKeyframeEnabled: (enabled) => set({ autoKeyframeEnabled: enabled }),
 
   selectedElementIds: new Set<string>(),
+  setSelection: (ids, anchor) => set(resolveElementSelection(ids, anchor)),
+  addSelectedElementId: (id: string) =>
+    set((s) => {
+      const next = new Set(s.selectedElementIds);
+      next.add(id);
+      return resolveElementSelection(next, s.selectedElementId);
+    }),
   toggleSelectedElementId: (id: string) =>
     set((s) => {
       const next = new Set(s.selectedElementIds);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      return { selectedElementIds: next };
+      return resolveElementSelection(next, s.selectedElementId);
     }),
-  clearSelectedElementIds: () => set({ selectedElementIds: new Set() }),
-
-  keyframeCache: new Map(),
-  setKeyframeCache: (elementId, data) =>
-    set((s) => {
-      const next = new Map(s.keyframeCache);
-      if (data) next.set(elementId, data);
-      else next.delete(elementId);
-      return { keyframeCache: next };
-    }),
+  clearSelection: () => set({ selectedElementId: null, selectedElementIds: new Set() }),
 
   requestedSeekTime: null,
   requestSeek: (time) => set({ requestedSeekTime: time }),
   clearSeekRequest: () => set({ requestedSeekTime: null }),
+
+  playbackRequest: null,
+  requestPlayback: (playing, returnTo = null) =>
+    set((s) => ({
+      playbackRequest: { playing, returnTo, nonce: (s.playbackRequest?.nonce ?? 0) + 1 },
+    })),
+  clearPlaybackRequest: () => set({ playbackRequest: null }),
+
+  clipRevealRequest: null,
+  requestClipReveal: (elementId) =>
+    set((s) => ({
+      clipRevealRequest: { elementId, nonce: (s.clipRevealRequest?.nonce ?? 0) + 1 },
+    })),
+  clearClipRevealRequest: () => set({ clipRevealRequest: null }),
+
+  timelineFocus: null,
+  timelineFocusNonce: 0,
+  requestTimelineFocus: (id) =>
+    set((s) => {
+      const nonce = s.timelineFocusNonce + 1;
+      return {
+        timelineFocusNonce: nonce,
+        timelineFocus: createTimelineFocusRequest(
+          id,
+          s.timelineProjectId,
+          s.timelineSessionEpoch,
+          nonce,
+        ),
+      };
+    }),
+  clearTimelineFocus: (nonce) =>
+    set((s) => (s.timelineFocus?.nonce === nonce ? { timelineFocus: null } : s)),
 
   lintFindingsByElement: new Map(),
   setLintFindingsByElement: (map) => set({ lintFindingsByElement: map }),
@@ -323,6 +413,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   setClipParentMap: (map) => set({ clipParentMap: map }),
   domClipChildren: [],
   setDomClipChildren: (children) => set({ domClipChildren: children }),
+  subCompositionHostState: new Map(),
+  setSubCompositionHostState: (state) => set({ subCompositionHostState: state }),
 
   setIsPlaying: (playing) => {
     if (get().isPlaying === playing) return;
@@ -336,8 +428,46 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     writeStudioUiPreferences({ audioMuted: muted });
     set({ audioMuted: muted });
   },
+  setAudioVolume: (volume) => {
+    const nextVolume = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1;
+    writeStudioUiPreferences({ audioVolume: nextVolume });
+    set({ audioVolume: nextVolume });
+  },
   setLoopEnabled: (enabled) => set({ loopEnabled: enabled }),
   setZoomMode: (mode) => set({ zoomMode: mode }),
+  clearSelectedElementIds: () => set({ selectedElementIds: new Set() }),
+  setSelectedElementIds: (ids: Set<string>) => set({ selectedElementIds: new Set(ids) }),
+  timelineSnapEnabled: readStudioUiPreferences().timelineSnapEnabled ?? true,
+  setTimelineSnapEnabled: (enabled) => {
+    writeStudioUiPreferences({ timelineSnapEnabled: enabled });
+    set({ timelineSnapEnabled: enabled });
+  },
+  rippleEditEnabled: readStudioUiPreferences().rippleEditEnabled ?? true, // default on
+  setRippleEditEnabled: (enabled) => {
+    writeStudioUiPreferences({ rippleEditEnabled: enabled });
+    set({ rippleEditEnabled: enabled });
+  },
+  timeDisplayMode: readStudioUiPreferences().timeDisplayMode ?? "time",
+  setTimeDisplayMode: (mode) => {
+    writeStudioUiPreferences({ timeDisplayMode: mode });
+    set({ timeDisplayMode: mode });
+  },
+  pinTimelineZoom: (currentPixelsPerSecond, fitPixelsPerSecond) =>
+    set((s) => {
+      // Already pinned (or the user manually zoomed) — never clobber that.
+      if (s.zoomMode === "manual") return {};
+      const percent = computePinnedZoomPercent(currentPixelsPerSecond, fitPixelsPerSecond);
+      writeStudioUiPreferences({
+        timelineZoomMode: "manual",
+        timelineManualZoomPercent: percent,
+      });
+      return { zoomMode: "manual", manualZoomPercent: percent };
+    }),
+  setTimelineScale: (pps, fitPps) => {
+    const state = get();
+    if (state.timelinePps === pps && state.timelineFitPps === fitPps) return;
+    set({ timelinePps: pps, timelineFitPps: fitPps });
+  },
   setInPoint: (time) =>
     set((state) => {
       const t = time !== null && Number.isFinite(time) ? time : null;
@@ -360,69 +490,110 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       };
     }),
   setManualZoomPercent: (percent) =>
-    set({ manualZoomPercent: Math.max(10, Math.min(2000, Math.round(percent))) }),
+    set((state) => ({
+      manualZoomPercent: clampTimelineZoomPercent(percent, state.timelineFitPps),
+    })),
+  bumpZEditVersion: () => set((state) => ({ zEditVersion: state.zEditVersion + 1 })),
   setCurrentTime: (time) => set({ currentTime: Number.isFinite(time) ? time : 0 }),
   setDuration: (duration) => set({ duration: Number.isFinite(duration) ? duration : 0 }),
-  setTimelineReady: (ready) => set({ timelineReady: ready }),
   setBeatDragging: (dragging) => set({ beatDragging: dragging }),
   setElements: (elements) => set({ elements }),
-  setSelectedElementId: (id) =>
-    set((s) =>
+  // A genuine single selection: always collapse the set to just this element. User
+  // intent (timeline click, preview click via applyDomSelection) flows here; DOM sync
+  // echoes that must preserve a group go through setSelectionAnchor instead.
+  setSelectedElementId: (id, options) =>
+    set((s) => {
+      const selectedElementIds = nextSelectionSet(s.selectedElementIds, id, options?.preserveSet);
       // Selecting a different element drops any active keyframe selection — otherwise
       // a stale activeKeyframePct from a prior diamond click would force the next drag
       // to "modify" a keyframe on the new element. A diamond click sets the pct AFTER
       // calling setSelectedElementId, so this never clobbers a genuine keyframe select.
-      id !== s.selectedElementId
-        ? { selectedElementId: id, activeKeyframePct: null, motionPathArmed: false }
-        : { selectedElementId: id },
-    ),
-  updateElement: (elementId, updates) =>
-    set((state) => ({
-      elements: state.elements.map((el) =>
-        (el.key ?? el.id) === elementId ? { ...el, ...updates } : el,
-      ),
-    })),
-  // Resets project-specific state when switching compositions.
-  // playbackRate, audioMuted, loopEnabled, zoomMode, and manualZoomPercent are intentionally preserved
-  // because they are user preferences that should survive project switches.
-  reset: () =>
-    set({
-      isPlaying: false,
-      currentTime: 0,
-      duration: 0,
-      timelineReady: false,
-      beatDragging: false,
-      elements: [],
-      selectedElementId: null,
-      inPoint: null,
-      outPoint: null,
-      activeTool: "select",
-      selectedKeyframes: new Set(),
-      selectedElementIds: new Set(),
-      keyframeCache: new Map(),
-      beatAnalysis: null,
-      beatEdits: null,
-      beatUndo: [],
-      beatRedo: [],
-      beatPersist: null,
-      clipManifest: null,
-      clipParentMap: new Map(),
-      domClipChildren: [],
+      // A reveal request survives the selection it is FOR. `openClipFxRack`
+      // raises the request and then selects the clip asynchronously, so the
+      // selection lands afterwards and used to clear the very request that
+      // caused it — the panel then read null and the section never opened.
+      // Any OTHER selection still drops it: a request aimed elsewhere is stale.
+      //
+      // Compared across the ID-SPACE BOUNDARY, which is why this needs saying:
+      // a request carries the BARE dom id (`runtimeAudioId`, because the panel
+      // and the runtime speak that), while this store's ids are
+      // `sourceFile#domId`. A direct `===` was silently never true — the exact
+      // shape of failure the id-space split produces.
+      const revealSurvives = revealTargetsSelection(s.revealedAudioFxTarget, id);
+      return id !== s.selectedElementId
+        ? {
+            selectedElementId: id,
+            selectedElementIds,
+            activeKeyframePct: null,
+            motionPathArmed: false,
+            focusedEaseSegment: null,
+            ...(revealSurvives ? {} : { revealedAudioFxTarget: null }),
+          }
+        : { selectedElementId: id, selectedElementIds };
     }),
+  // Move the anchor within an active multi-selection WITHOUT collapsing it — used by
+  // DOM->store sync echoes while a group gesture re-patches the preview. A non-member
+  // id is treated as a genuine new single selection.
+  setSelectionAnchor: (id) =>
+    set((s) => {
+      if (id != null && s.selectedElementIds.size > 1 && s.selectedElementIds.has(id)) {
+        return {
+          selectedElementId: id,
+          focusedEaseSegment: id === s.selectedElementId ? s.focusedEaseSegment : null,
+        };
+      }
+      return {
+        selectedElementId: id,
+        selectedElementIds: id ? new Set([id]) : new Set<string>(),
+        focusedEaseSegment: id === s.selectedElementId ? s.focusedEaseSegment : null,
+      };
+    }),
+  updateElement: (elementId, updates) => {
+    if (queueElementPatch(elementId, updates)) return;
+    set((state) => ({ elements: patchElements(state.elements, new Map([[elementId, updates]])) }));
+  },
+  // UI preferences intentionally survive reset. So do timelineSessionEpoch and
+  // focusedEaseRequestNonce: the epoch advances only when project identity
+  // changes, while a monotonic nonce prevents collisions with stale consumers.
+  beginTimelineSession: (projectId) =>
+    set((state) => {
+      if (state.timelineProjectId === projectId) return state;
+      return {
+        ...createTimelineResetState(),
+        timelineSessionEpoch: state.timelineSessionEpoch + 1,
+        timelineProjectId: projectId,
+      };
+    }),
+  reset: () => set(createTimelineResetState()),
 }));
 
-// Bug-bash aid: expose the store so a reproduction can dump live state from the
-// console, e.g. `__playerStore.getState().selectedElementId`. Harmless read
-// handle; no behavioural effect.
-// Only in dev. `import.meta.env` may be undefined in non-Vite bundlers (Next.js
-// Turbopack), so guard the access like the telemetry client does.
-function isDevBuild(): boolean {
-  try {
-    return import.meta.env.DEV === true;
-  } catch {
-    return false;
-  }
+attachPlayerStoreDevHandle(usePlayerStore);
+
+export function isPreviewBooted(projectId: string): boolean {
+  const { previewBooted, timelineProjectId } = usePlayerStore.getState();
+  return previewBooted && timelineProjectId === projectId;
 }
-if (isDevBuild() && typeof window !== "undefined") {
-  (window as unknown as { __playerStore?: typeof usePlayerStore }).__playerStore = usePlayerStore;
+
+/** True once projectId's live preview has booted, false once another project replaces it.
+ * Open-time work the first frame does not need (server parses, lint) waits on it. */
+export function whenPreviewBooted(projectId: string): Promise<boolean> {
+  const openedFrom = usePlayerStore.getState().timelineProjectId;
+  let seen = false;
+  const settle = (state: PlayerState): boolean | null => {
+    if (state.timelineProjectId === projectId) {
+      seen = true;
+      return state.previewBooted ? true : null;
+    }
+    return seen || state.timelineProjectId !== openedFrom ? false : null;
+  };
+  return new Promise((resolve) => {
+    const now = settle(usePlayerStore.getState());
+    if (now !== null) return resolve(now);
+    const stop = usePlayerStore.subscribe((state) => {
+      const result = settle(state);
+      if (result === null) return;
+      stop();
+      resolve(result);
+    });
+  });
 }

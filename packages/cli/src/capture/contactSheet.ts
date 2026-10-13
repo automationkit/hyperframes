@@ -5,8 +5,9 @@
  * Saves 50-65% tokens vs. AI agents reading images individually.
  */
 
-import sharp from "sharp";
-import { readdirSync, readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
+import sharp, { type OverlayOptions } from "sharp";
+import { readdirSync, readFileSync, unlinkSync, existsSync } from "node:fs";
+import { writeCaptureFileSync } from "./captureFile.js";
 import { join, extname, basename, dirname } from "node:path";
 
 interface ContactSheetOptions {
@@ -18,6 +19,8 @@ interface ContactSheetOptions {
   quality?: number;
   /** Target width per cell in pixels (default: 600) */
   cellWidth?: number;
+  /** Cooperative boundary checked before starting each native Sharp page. */
+  remainingMs?: () => number;
 }
 
 /**
@@ -39,6 +42,8 @@ export async function createContactSheet(
     cellWidth = 600,
   } = opts;
 
+  if ((opts.remainingMs?.() ?? 1) <= 0) return null;
+
   const files = imagePaths.slice(0, maxImages);
   if (files.length === 0) return null;
 
@@ -57,7 +62,7 @@ export async function createContactSheet(
   const totalW = cols * cellW + (cols + 1) * padding;
   const totalH = rows * (cellH + labelH) + (rows + 1) * padding;
 
-  const overlays: sharp.OverlayOptions[] = [];
+  const overlays: OverlayOptions[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const col = i % cols;
@@ -93,17 +98,22 @@ export async function createContactSheet(
     overlays.push({ input: labelSvg, left: x, top: y });
   }
 
-  await sharp({
+  const sheet = sharp({
     create: {
       width: totalW,
       height: totalH,
       channels: 3,
       background: { r: 26, g: 26, b: 26 },
     },
-  })
-    .composite(overlays)
-    .jpeg({ quality })
-    .toFile(outputPath);
+  }).composite(overlays);
+
+  // Encode to a buffer and write through the capture writer rather than
+  // `toFile`, which opens the path itself and would follow a planted link.
+  const encoded =
+    extname(outputPath).toLowerCase() === ".png"
+      ? await sheet.png().toBuffer()
+      : await sheet.jpeg({ quality }).toBuffer();
+  writeCaptureFileSync(outputPath, encoded);
 
   return outputPath;
 }
@@ -122,6 +132,7 @@ function escapeXml(s: string): string {
  * Output files: basePath → base-1.jpg, base-2.jpg, ...
  * Returns the list of written file paths (empty if no images).
  */
+// fallow-ignore-next-line complexity
 async function createContactSheetPages(
   imagePaths: string[],
   outputBasePath: string,
@@ -130,7 +141,7 @@ async function createContactSheetPages(
   customLabels?: string[],
 ): Promise<string[]> {
   if (imagePaths.length === 0) return [];
-  const { pageSize = imagePaths.length, ...sheetOpts } = opts;
+  const { pageSize = imagePaths.length, remainingMs, ...sheetOpts } = opts;
   const ext = outputBasePath.match(/\.[^.]+$/)?.[0] ?? ".jpg";
   const base = outputBasePath.slice(0, -ext.length);
 
@@ -138,6 +149,7 @@ async function createContactSheetPages(
   const results: string[] = [];
 
   for (let p = 0; p < pages; p++) {
+    if ((remainingMs?.() ?? 1) <= 0) break;
     const chunk = imagePaths.slice(p * pageSize, (p + 1) * pageSize);
     const chunkLabels = customLabels?.slice(p * pageSize, (p + 1) * pageSize);
     const outPath = pages === 1 ? outputBasePath : `${base}-${p + 1}${ext}`;
@@ -167,6 +179,7 @@ async function createContactSheetPages(
 export async function createScrollContactSheet(
   screenshotsDir: string,
   outputPath: string,
+  budget: Pick<ContactSheetOptions, "remainingMs"> = {},
 ): Promise<string[]> {
   if (!existsSync(screenshotsDir)) return [];
 
@@ -186,7 +199,7 @@ export async function createScrollContactSheet(
   return createContactSheetPages(
     paths,
     outputPath,
-    { cols: 3, cellWidth: 600, pageSize: 9 },
+    { cols: 3, cellWidth: 600, pageSize: 9, ...budget },
     0,
     labels,
   );
@@ -200,6 +213,7 @@ export async function createScrollContactSheet(
 export async function createSnapshotContactSheet(
   snapshotsDir: string,
   outputPath: string,
+  budget: Pick<ContactSheetOptions, "remainingMs"> = {},
 ): Promise<string[]> {
   if (!existsSync(snapshotsDir)) return [];
 
@@ -219,7 +233,7 @@ export async function createSnapshotContactSheet(
   return createContactSheetPages(
     paths,
     outputPath,
-    { cols: 3, cellWidth: 600, pageSize: 9 },
+    { cols: 3, cellWidth: 600, pageSize: 9, ...budget },
     0,
     labels,
   );
@@ -233,6 +247,7 @@ export async function createSnapshotContactSheet(
 export async function createAssetContactSheet(
   assetsDir: string,
   outputPath: string,
+  budget: Pick<ContactSheetOptions, "remainingMs"> = {},
 ): Promise<string[]> {
   if (!existsSync(assetsDir)) return [];
 
@@ -251,6 +266,7 @@ export async function createAssetContactSheet(
     cellWidth: 480,
     labelMode: "filename",
     pageSize: 12,
+    ...budget,
   });
 }
 
@@ -263,10 +279,12 @@ export async function createAssetContactSheet(
  * parent assets/ root (for external SVGs downloaded as <img src="*.svg">).
  * Files are deduplicated by basename so duplicates across dirs are collapsed.
  */
+// fallow-ignore-next-line complexity
 export async function createSvgContactSheet(
   svgsDir: string,
   outputPath: string,
   assetsRootDir?: string,
+  budget: Pick<ContactSheetOptions, "remainingMs"> = {},
 ): Promise<string[]> {
   const dirsToScan = [svgsDir, assetsRootDir].filter(
     (d): d is string => d !== undefined && existsSync(d),
@@ -298,6 +316,7 @@ export async function createSvgContactSheet(
   const labels: string[] = [];
 
   for (let i = 0; i < svgPaths.length; i++) {
+    if ((budget.remainingMs?.() ?? 1) <= 0) break;
     const svgPath = svgPaths[i]!;
     const tmpPath = join(tmpDir, `.thumb-${i}.png`);
     try {
@@ -310,7 +329,7 @@ export async function createSvgContactSheet(
         .flatten({ background: { r: 245, g: 245, b: 245 } })
         .png()
         .toBuffer();
-      writeFileSync(tmpPath, thumb);
+      writeCaptureFileSync(tmpPath, thumb);
       tmpPaths.push(tmpPath);
       labels.push(svgFileNames[i]!.replace(".svg", ""));
     } catch {
@@ -330,6 +349,7 @@ export async function createSvgContactSheet(
         cols: 5,
         cellWidth: thumbSize,
         pageSize: 15,
+        ...budget,
       },
       0,
       labels,

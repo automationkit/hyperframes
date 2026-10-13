@@ -17,14 +17,15 @@ export interface DockerRunArgsInput {
   outputDir: string;
   /** Filename within `outputDir` (joined to /output inside the container). */
   outputFilename: string;
+  hostStdoutIsTty?: boolean;
   /**
    * Docker `--platform` value (`linux/amd64` or `linux/arm64`). When omitted,
    * resolves to the host architecture via `resolveDockerPlatform()`. Pinning
    * to `linux/amd64` on an arm64 host (the legacy default) forces qemu
    * emulation of chrome-headless-shell, which segfaults or stalls on Apple
-   * Silicon — see issue #1193. Native `linux/arm64` falls back to the
-   * system chromium baked into the image at the cost of byte-for-byte
-   * parity with amd64 renders.
+   * Silicon — see issue #1193. Native `linux/arm64` uses Playwright's pinned
+   * arm64 chrome-headless-shell baked into the image at the cost of
+   * byte-for-byte parity with amd64 renders.
    */
   platform?: string;
   options: DockerRenderOptions;
@@ -39,8 +40,9 @@ export interface DockerRenderOptions {
    */
   fps: Fps;
   quality: "draft" | "standard" | "high";
-  format: "mp4" | "webm" | "mov" | "png-sequence" | "gif";
+  format: "mp4" | "webm" | "mov" | "png-sequence" | "gif" | "hls";
   gifLoop?: number;
+  hlsSegmentSeconds?: number;
   workers?: number;
   gpu: boolean;
   browserGpu: boolean;
@@ -51,11 +53,14 @@ export interface DockerRenderOptions {
   videoFrameFormat?: "auto" | "jpg" | "png";
   quiet: boolean;
   debug?: boolean;
+  bestEffort?: boolean;
   variables?: Record<string, unknown>;
   entryFile?: string;
   /** Output resolution preset (e.g. "landscape-4k"). Forwarded as `--resolution`. */
   outputResolution?: string;
   pageSideCompositing?: boolean;
+  /** EXPERIMENTAL. drawElementImage frame capture; forwarded as `--experimental-fast-capture`. */
+  experimentalFastCapture?: boolean;
   /**
    * Puppeteer page-navigation timeout, in milliseconds. Forwarded to the
    * in-container CLI as `--browser-timeout <seconds>` (the CLI takes
@@ -63,6 +68,10 @@ export interface DockerRenderOptions {
    * `--browser-timeout` flag).
    */
   pageNavigationTimeoutMs?: number;
+  /** CDP protocol timeout in milliseconds. */
+  protocolTimeoutMs?: number;
+  /** Player readiness timeout in milliseconds. */
+  playerReadyTimeoutMs?: number;
 }
 
 /**
@@ -101,6 +110,7 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
   return [
     "run",
     "--rm",
+    ...(input.hostStdoutIsTty ? ["-e", "HYPERFRAMES_STDOUT_IS_TTY=1"] : []),
     "--platform",
     platform,
     "--shm-size=2g",
@@ -125,6 +135,9 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     "--format",
     options.format,
     ...(options.gifLoop != null ? ["--gif-loop", String(options.gifLoop)] : []),
+    ...(options.hlsSegmentSeconds != null
+      ? ["--hls-segment-seconds", String(options.hlsSegmentSeconds)]
+      : []),
     ...(options.workers != null ? ["--workers", String(options.workers)] : []),
     ...(options.crf != null ? ["--crf", String(options.crf)] : []),
     ...(options.vp9CpuUsed != null ? ["--vp9-cpu-used", String(options.vp9CpuUsed)] : []),
@@ -134,6 +147,9 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
       : []),
     ...(options.quiet ? ["--quiet"] : []),
     ...(options.debug ? ["--debug"] : []),
+    // The in-container CLI is best-effort by default. Only forward the
+    // explicit strict opt-in so Docker and local renders cannot drift.
+    ...(options.bestEffort === false ? ["--no-best-effort"] : []),
     ...(options.gpu ? ["--gpu"] : []),
     ...(options.browserGpu ? [] : ["--no-browser-gpu"]),
     ...(options.hdrMode === "force-hdr" ? ["--hdr"] : []),
@@ -144,8 +160,15 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     ...(options.entryFile ? ["--composition", options.entryFile] : []),
     ...(options.outputResolution ? ["--resolution", options.outputResolution] : []),
     ...(options.pageSideCompositing === false ? ["--no-page-side-compositing"] : []),
+    ...(options.experimentalFastCapture ? ["--experimental-fast-capture"] : []),
     ...(options.pageNavigationTimeoutMs != null
       ? ["--browser-timeout", String(options.pageNavigationTimeoutMs / 1000)]
+      : []),
+    ...(options.protocolTimeoutMs != null
+      ? ["--protocol-timeout", String(options.protocolTimeoutMs)]
+      : []),
+    ...(options.playerReadyTimeoutMs != null
+      ? ["--player-ready-timeout", String(options.playerReadyTimeoutMs)]
       : []),
   ];
 }

@@ -27,6 +27,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -34,12 +35,23 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { applyFaststart, muxVideoWithAudio, runFfmpeg } from "@hyperframes/engine";
+import {
+  appendRenderProvenanceArgs,
+  applyFaststart,
+  describeFfmpegFailure,
+  MIXED_AUDIO_FILENAME,
+  muxVideoWithAudio,
+  resolveConfig,
+  runFfmpeg,
+} from "@hyperframes/engine";
 import { fpsToFfmpegArg } from "@hyperframes/core";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
 import { formatExportFrameName } from "../../utils/paths.js";
 import { padOrTrimAudioToVideoFrameCount } from "../render/audioPadTrim.js";
+import { encoderFailureError } from "../render/encoderInterruption.js";
 import type { ChunkSliceJson } from "../render/stages/freezePlan.js";
+import { DISTRIBUTED_RENDER_CAPABILITIES, readPlanProtocolV1 } from "./planProtocol.js";
+import { validatePlanV2MaterializedTarget } from "./planV2.js";
 import type { DistributedFormat } from "./shared.js";
 
 /**
@@ -56,6 +68,7 @@ export interface AssembleResult {
 
 /** Shape of the planDir's top-level `plan.json` — only the fields `assemble` needs. */
 interface PlanJsonForAssemble {
+  protocol?: unknown;
   planHash: string;
   totalFrames: number;
   hasAudio: boolean;
@@ -75,7 +88,7 @@ interface PlanJsonForAssemble {
  * @param chunkPaths — ordered chunk outputs, length === `chunks.json` length.
  *   For mp4/mov each entry is a path to an encoded chunk file; for
  *   png-sequence each entry is a path to a directory of frames.
- * @param audioPath — `<planDir>/audio.aac` for mux'd formats. Pass `null`
+ * @param audioPath — `<planDir>/<MIXED_AUDIO_FILENAME>` for mux'd formats. Pass `null`
  *   when the composition has no audio (or `assemble` is being called for a
  *   format whose audio is muxed elsewhere). `assemble` always normalizes
  *   audio length against the assembled video's frame count when
@@ -111,6 +124,7 @@ export async function assemble(
   const log = options?.logger ?? defaultLogger;
   const abortSignal = options?.abortSignal;
   const cfr = options?.cfr === true;
+  const { ffmpegProcessTimeout } = resolveConfig();
 
   // ── 1. Validate planDir manifest matches chunkPaths shape ──────────────
   const planJsonPath = join(planDir, "plan.json");
@@ -118,10 +132,12 @@ export async function assemble(
   if (!existsSync(planJsonPath)) {
     throw new Error(`[assemble] planDir missing plan.json: ${planJsonPath}`);
   }
+  const plan = JSON.parse(readFileSync(planJsonPath, "utf-8")) as PlanJsonForAssemble;
+  readPlanProtocolV1(plan, DISTRIBUTED_RENDER_CAPABILITIES.roles.assembler);
+  validatePlanV2MaterializedTarget(planDir, { role: "assembler" });
   if (!existsSync(chunksJsonPath)) {
     throw new Error(`[assemble] planDir missing meta/chunks.json: ${chunksJsonPath}`);
   }
-  const plan = JSON.parse(readFileSync(planJsonPath, "utf-8")) as PlanJsonForAssemble;
   const chunks = JSON.parse(readFileSync(chunksJsonPath, "utf-8")) as ChunkSliceJson[];
   if (chunkPaths.length !== chunks.length) {
     throw new Error(
@@ -145,9 +161,7 @@ export async function assemble(
   if (!existsSync(dirname(outputPath))) {
     mkdirSync(dirname(outputPath), { recursive: true });
   }
-  const workDir = `${outputPath}.assemble-work`;
-  if (existsSync(workDir)) rmSync(workDir, { recursive: true, force: true });
-  mkdirSync(workDir, { recursive: true });
+  const workDir = mkdtempSync(`${outputPath}.assemble-work-`);
 
   try {
     const concatOutputPath = join(workDir, `concat.${plan.dimensions.format}`);
@@ -167,13 +181,18 @@ export async function assemble(
     // touching the encoded stream. Multi-chunk renders continue through
     // the concat demuxer where the existing `-r` input flag works.
     if (chunkPaths.length === 1) {
-      const remuxArgs = ["-i", chunkPaths[0]!, "-c", "copy", "-r", fpsArg, "-y", concatOutputPath];
-      const remuxResult = await runFfmpeg(remuxArgs, { signal: abortSignal });
+      const remuxArgs = ["-i", chunkPaths[0]!, "-c", "copy", "-r", fpsArg];
+      appendRenderProvenanceArgs(remuxArgs, concatOutputPath);
+      remuxArgs.push("-y", concatOutputPath);
+      const remuxResult = await runFfmpeg(remuxArgs, {
+        signal: abortSignal,
+        timeout: ffmpegProcessTimeout,
+      });
       if (!remuxResult.success) {
-        throw new Error(
-          `[assemble] ffmpeg single-chunk remux failed (exit ${remuxResult.exitCode}): ` +
-            `${remuxResult.stderr.slice(-400)}`,
-        );
+        throw encoderFailureError("[assemble] ffmpeg single-chunk remux failed", {
+          error: describeFfmpegFailure(remuxResult, ffmpegProcessTimeout),
+          failureReason: remuxResult.failureReason,
+        });
       }
     } else {
       // Concat list file — one `file '<path>'` per chunk, in order. ffmpeg's
@@ -200,15 +219,18 @@ export async function assemble(
         concatListPath,
         "-c",
         "copy",
-        "-y",
-        concatOutputPath,
       ];
-      const concatResult = await runFfmpeg(concatArgs, { signal: abortSignal });
+      appendRenderProvenanceArgs(concatArgs, concatOutputPath);
+      concatArgs.push("-y", concatOutputPath);
+      const concatResult = await runFfmpeg(concatArgs, {
+        signal: abortSignal,
+        timeout: ffmpegProcessTimeout,
+      });
       if (!concatResult.success) {
-        throw new Error(
-          `[assemble] ffmpeg concat-copy failed (exit ${concatResult.exitCode}): ` +
-            `${concatResult.stderr.slice(-400)}`,
-        );
+        throw encoderFailureError("[assemble] ffmpeg concat-copy failed", {
+          error: describeFfmpegFailure(concatResult, ffmpegProcessTimeout),
+          failureReason: concatResult.failureReason,
+        });
       }
     }
 
@@ -270,15 +292,18 @@ export async function assemble(
         "cfr",
         "-r",
         fpsArg,
-        "-y",
-        cfrOutputPath,
       ];
-      const cfrResult = await runFfmpeg(cfrArgs, { signal: abortSignal });
+      appendRenderProvenanceArgs(cfrArgs, cfrOutputPath);
+      cfrArgs.push("-y", cfrOutputPath);
+      const cfrResult = await runFfmpeg(cfrArgs, {
+        signal: abortSignal,
+        timeout: ffmpegProcessTimeout,
+      });
       if (!cfrResult.success) {
-        throw new Error(
-          `[assemble] ffmpeg cfr re-encode failed (exit ${cfrResult.exitCode}): ` +
-            `${cfrResult.stderr.slice(-400)}`,
-        );
+        throw encoderFailureError("[assemble] ffmpeg cfr re-encode failed", {
+          error: describeFfmpegFailure(cfrResult, ffmpegProcessTimeout),
+          failureReason: cfrResult.failureReason,
+        });
       }
       postConcatPath = cfrOutputPath;
       log.info("[assemble] cfr re-encode applied", {
@@ -289,18 +314,20 @@ export async function assemble(
     }
 
     // ── 3. Audio: pad-or-trim then mux ────────────────────────────────────
-    let audioForMux: string | null = null;
+    let normalizedAudioPath: string | null = null;
     if (audioPath !== null && existsSync(audioPath)) {
-      const paddedAudioPath = join(workDir, "audio-padded.aac");
+      const paddedAudioPath = join(workDir, "audio-padded.m4a");
       const padTrimResult = await padOrTrimAudioToVideoFrameCount({
         videoPath: postConcatPath,
         audioPath,
         outputPath: paddedAudioPath,
+        signal: abortSignal,
+        timeoutMs: ffmpegProcessTimeout,
       });
       if (!padTrimResult.success) {
-        throw new Error(`[assemble] audio pad/trim failed: ${padTrimResult.error}`);
+        throw encoderFailureError("[assemble] audio pad/trim failed", padTrimResult);
       }
-      audioForMux = paddedAudioPath;
+      normalizedAudioPath = paddedAudioPath;
       log.info("[assemble] audio normalized for mux", {
         operation: padTrimResult.operation,
         targetDurationSeconds: padTrimResult.targetDurationSeconds,
@@ -313,18 +340,20 @@ export async function assemble(
     // because it operates on a `RenderJob` and emits `updateJobStatus`
     // payloads — the distributed activity has no job to thread through.
     const muxOutputPath =
-      audioForMux !== null ? join(workDir, `mux.${plan.dimensions.format}`) : postConcatPath;
-    if (audioForMux !== null) {
+      normalizedAudioPath !== null
+        ? join(workDir, `mux.${plan.dimensions.format}`)
+        : postConcatPath;
+    if (normalizedAudioPath !== null) {
       const muxResult = await muxVideoWithAudio(
         postConcatPath,
-        audioForMux,
+        normalizedAudioPath,
         muxOutputPath,
         abortSignal,
-        { audioCodec: "aac" },
+        { audioCodec: "aac", ffmpegProcessTimeout },
         { num: plan.dimensions.fpsNum, den: plan.dimensions.fpsDen },
       );
       if (!muxResult.success) {
-        throw new Error(`[assemble] audio mux failed: ${muxResult.error}`);
+        throw encoderFailureError("[assemble] audio mux failed", muxResult);
       }
     }
 
@@ -334,14 +363,14 @@ export async function assemble(
       muxOutputPath,
       outputPath,
       abortSignal,
-      undefined,
+      { ffmpegProcessTimeout },
       {
         num: plan.dimensions.fpsNum,
         den: plan.dimensions.fpsDen,
       },
     );
     if (!faststartResult.success) {
-      throw new Error(`[assemble] faststart failed: ${faststartResult.error}`);
+      throw encoderFailureError("[assemble] faststart failed", faststartResult);
     }
   } finally {
     try {
@@ -370,9 +399,9 @@ export async function assemble(
  * into the merged output so consumers see one continuous numbered sequence.
  *
  * Audio is intentionally NOT muxed here — png-sequence has no container.
- * If `audioPath` is non-null we copy it alongside as `audio.aac` so callers
- * who need to re-mux later (After Effects, Nuke, ffmpeg image2 + audio) can
- * find it.
+ * If `audioPath` is non-null we copy it alongside under the engine's mixed-audio
+ * filename so callers who need to re-mux later (After Effects, Nuke, ffmpeg
+ * image2 + audio) can find it.
  */
 function mergePngFrameDirs(
   chunkPaths: readonly string[],
@@ -420,7 +449,7 @@ function mergePngFrameDirs(
   // containers); png-sequence has no encoder, so we copy the audio
   // verbatim. The sidecar matches the in-process png-sequence convention.
   if (audioPath !== null && existsSync(audioPath)) {
-    const sidecar = join(outputPath, "audio.aac");
+    const sidecar = join(outputPath, MIXED_AUDIO_FILENAME);
     cpSync(audioPath, sidecar);
   }
 

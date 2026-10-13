@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
-import type { Stats } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, type Stats } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import {
   MAX_PAGE_NAVIGATION_TIMEOUT_SECONDS,
+  hasExplicitCompositionArg,
   parseBrowserTimeoutMsArg,
+  resolveDiagnosticNavigationTimeoutMs,
   parseCompositionEntryArg,
   parseGifLoopArg,
+  parseHlsSegmentSecondsArg,
+  resolveDefaultFpsArg,
   type BrowserTimeoutParseResult,
   type CompositionEntryParseResult,
 } from "./renderArgs.js";
@@ -101,7 +106,50 @@ describe("parseBrowserTimeoutMsArg", () => {
   });
 });
 
+describe("resolveDiagnosticNavigationTimeoutMs", () => {
+  it("uses the render navigation timeout env override", () => {
+    expect(
+      resolveDiagnosticNavigationTimeoutMs({ PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: "90000" }),
+    ).toBe(90_000);
+  });
+
+  it("falls back to ten seconds for missing or invalid values", () => {
+    expect(resolveDiagnosticNavigationTimeoutMs({})).toBe(10_000);
+    expect(
+      resolveDiagnosticNavigationTimeoutMs({ PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: "invalid" }),
+    ).toBe(10_000);
+  });
+
+  it("raises the diagnostic navigation budget to a larger caller-provided minimum", () => {
+    expect(resolveDiagnosticNavigationTimeoutMs({}, 30_000)).toBe(30_000);
+  });
+
+  it("does not let a caller-provided minimum shorten the default budget", () => {
+    expect(resolveDiagnosticNavigationTimeoutMs({}, 3_000)).toBe(10_000);
+  });
+
+  it("does not let a caller-provided minimum shorten the environment override", () => {
+    expect(
+      resolveDiagnosticNavigationTimeoutMs(
+        { PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: "90000" },
+        30_000,
+      ),
+    ).toBe(90_000);
+  });
+});
+
 describe("parseCompositionEntryArg", () => {
+  it("uses one sentinel classifier for default and explicit composition values", () => {
+    expect([undefined, "", "   ", ".", "./"].map(hasExplicitCompositionArg)).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(hasExplicitCompositionArg("./compositions/intro.html")).toBe(true);
+  });
+
   const PROJECT = "/proj";
   const stat = makeStat({
     [resolve(PROJECT, "index.html")]: "file",
@@ -173,6 +221,70 @@ describe("parseCompositionEntryArg", () => {
   });
 });
 
+describe("resolveDefaultFpsArg", () => {
+  function writeComposition(path: string, fps: string): void {
+    writeFileSync(
+      path,
+      `<!DOCTYPE html><html><body><div data-composition-id="root" data-root="true" data-fps="${fps}">x</div></body></html>`,
+    );
+  }
+
+  function makeProject(): {
+    dir: string;
+    indexPath: string;
+    entryFile: string;
+    cleanup: () => void;
+  } {
+    const dir = mkdtempSync(join(tmpdir(), "hyperframes-render-fps-"));
+    const indexPath = join(dir, "index.html");
+    const entryFile = "compositions/intro.html";
+    const entryPath = join(dir, entryFile);
+    writeComposition(indexPath, "24");
+    mkdirSync(dirname(entryPath), { recursive: true });
+    return {
+      dir,
+      indexPath,
+      entryFile,
+      cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  it("reads data-fps from the --composition target instead of index.html", () => {
+    const project = makeProject();
+    try {
+      writeComposition(join(project.dir, project.entryFile), "60");
+
+      expect(
+        resolveDefaultFpsArg(undefined, project.dir, project.indexPath, project.entryFile),
+      ).toBe("60");
+    } finally {
+      project.cleanup();
+    }
+  });
+
+  it("falls back to index.html data-fps when --composition is not set", () => {
+    const project = makeProject();
+    try {
+      expect(resolveDefaultFpsArg(undefined, project.dir, project.indexPath, undefined)).toBe("24");
+    } finally {
+      project.cleanup();
+    }
+  });
+
+  it("keeps an explicit --fps value ahead of any composition default", () => {
+    const project = makeProject();
+    try {
+      writeComposition(join(project.dir, project.entryFile), "60");
+
+      expect(resolveDefaultFpsArg("120", project.dir, project.indexPath, project.entryFile)).toBe(
+        "120",
+      );
+    } finally {
+      project.cleanup();
+    }
+  });
+});
+
 describe("parseGifLoopArg", () => {
   it("accepts absent flag, bounds, and integers", () => {
     expect(parseGifLoopArg(undefined)).toEqual({ ok: true, value: undefined });
@@ -185,5 +297,22 @@ describe("parseGifLoopArg", () => {
     expect(parseGifLoopArg("65536").ok).toBe(false);
     expect(parseGifLoopArg("1.5").ok).toBe(false);
     expect(parseGifLoopArg(" ").ok).toBe(false);
+  });
+});
+
+describe("parseHlsSegmentSecondsArg", () => {
+  it("accepts absent flag and whole seconds in range", () => {
+    expect(parseHlsSegmentSecondsArg(undefined)).toEqual({ ok: true, value: undefined });
+    expect(parseHlsSegmentSecondsArg("1")).toEqual({ ok: true, value: 1 });
+    expect(parseHlsSegmentSecondsArg(" 6 ")).toEqual({ ok: true, value: 6 });
+    expect(parseHlsSegmentSecondsArg("60")).toEqual({ ok: true, value: 60 });
+  });
+
+  // Fractional seconds would make ffmpeg's integer #EXT-X-TARGETDURATION lie.
+  it("rejects zero, fractional, out-of-range, and empty inputs", () => {
+    expect(parseHlsSegmentSecondsArg("0").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg("2.5").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg("61").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg(" ").ok).toBe(false);
   });
 });

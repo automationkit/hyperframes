@@ -1,10 +1,108 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+// Imported before "./validate.js" below: validate.js's own static import of
+// ../utils/project.js triggers that mocked module's factory as soon as
+// validate.js loads, so resolveProjectMock/lintProjectFailureMock must
+// already be bound by then (see the vi.mock calls a few lines down).
 import {
+  lintProjectFailureMock,
+  metaDescription,
+  resolveProjectMock,
+  runAndCaptureStdio,
+  runAndParseJsonEnvelope,
+} from "./deprecationTestHarness.js";
+import {
+  auditClipDurations,
   extractCompositionErrorsFromLint,
+  navigationTimeoutHint,
+  projectPathOfUrl,
   raceMediaReady,
+  resolveNavigationTimeoutMs,
   shouldIgnoreRequestFailure,
+  shouldIgnoreHttpError,
 } from "./validate.js";
+import { waitForPreferredSeekTarget } from "../capture/captureCompositionFrame.js";
 import type { ProjectLintResult } from "../utils/lintProject.js";
+
+// validateInBrowser lazy-loads the producer localize helpers via loadProducer;
+// mock it so these unit tests never resolve @hyperframes/producer's built dist.
+vi.mock("../utils/producer.js", () => ({
+  loadProducer: vi.fn(async () => ({
+    localizeRemoteMediaSources: vi.fn(async (html: string) => ({
+      html,
+      remoteMediaAssets: new Map(),
+    })),
+    localizeRemoteImageSources: vi.fn(async (html: string) => ({
+      html,
+      remoteMediaAssets: new Map(),
+    })),
+    localizeRemoteFontFaces: vi.fn(async (html: string) => ({
+      html,
+      remoteMediaAssets: new Map(),
+    })),
+  })),
+}));
+
+// U5 deprecation tests: resolveProject and lintProject are both reached via a
+// dynamic `await import(...)` inside validate.ts's run() / validateInBrowser(),
+// so vi.mock intercepts them the same way it would a static import. Mocking
+// resolveProject skips real filesystem project resolution; mocking lintProject
+// (the first await inside validateInBrowser) gives a fast, deterministic
+// failure well before any real browser or network work — exercising run()'s
+// outer catch (the JSON failure envelope) without needing headless Chrome.
+vi.mock("../utils/project.js", () => resolveProjectMock());
+vi.mock("../utils/lintProject.js", () => lintProjectFailureMock());
+
+describe("auditClipDurations", () => {
+  it("audits audio only because explicit video slots hold their final frame", async () => {
+    let selector = "";
+    const originalDocument = globalThis.document;
+    const audio = {
+      duration: 1,
+      id: "voice",
+      loop: false,
+      tagName: "AUDIO",
+      getAttribute: (name: string) =>
+        name === "data-duration" ? "5" : name === "data-media-start" ? "0" : null,
+    };
+    const page = {
+      evaluate: async (fn: (waitMs: number) => unknown, waitMs: number) => {
+        Object.defineProperty(globalThis, "document", {
+          configurable: true,
+          value: {
+            querySelectorAll: (query: string) => {
+              selector = query;
+              return [audio];
+            },
+          },
+        });
+        return fn(waitMs);
+      },
+    };
+
+    try {
+      const warnings = await auditClipDurations(
+        page as never,
+        ({ slotSeconds, mediaSeconds }) => ({
+          shortfallSeconds: slotSeconds - mediaSeconds,
+          toleranceSeconds: 0.05,
+        }),
+        10,
+      );
+      expect(selector).toBe("audio[data-duration]");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.text).toContain('Audio "voice"');
+    } finally {
+      if (originalDocument === undefined) {
+        Reflect.deleteProperty(globalThis, "document");
+      } else {
+        Object.defineProperty(globalThis, "document", {
+          configurable: true,
+          value: originalDocument,
+        });
+      }
+    }
+  });
+});
 
 // Regression for the validate audio-duration-probe timeout: a slow-loading
 // media element's duration was snapshotted once, at a fixed point in time,
@@ -56,6 +154,18 @@ describe("raceMediaReady", () => {
 });
 
 describe("shouldIgnoreRequestFailure", () => {
+  it("ignores only the optional root caption overrides 404/abort", () => {
+    const url = "http://127.0.0.1:3000/caption-overrides.json";
+    expect(shouldIgnoreHttpError(url, 404)).toBe(true);
+    expect(shouldIgnoreRequestFailure(url, "net::ERR_ABORTED", "fetch")).toBe(true);
+    expect(shouldIgnoreHttpError(url, 500)).toBe(false);
+    expect(shouldIgnoreRequestFailure(url, "net::ERR_FAILED", "fetch")).toBe(false);
+    expect(shouldIgnoreHttpError("http://127.0.0.1:3000/transcript.json", 404)).toBe(false);
+    expect(shouldIgnoreHttpError("http://127.0.0.1:3000/assets/caption-overrides.json", 404)).toBe(
+      false,
+    );
+  });
+
   it("ignores aborted media preload requests", () => {
     expect(
       shouldIgnoreRequestFailure("http://127.0.0.1:3000/assets/sfx.wav", "net::ERR_ABORTED"),
@@ -89,6 +199,38 @@ describe("shouldIgnoreRequestFailure", () => {
   });
 });
 
+describe("waitForPreferredSeekTarget", () => {
+  it("waits for the runtime player/bridge target before falling back to raw timelines", async () => {
+    const page = {
+      waitForFunction: vi.fn(async () => undefined),
+    };
+
+    await waitForPreferredSeekTarget(page, 123);
+
+    expect(page.waitForFunction).toHaveBeenCalledWith(expect.any(Function), { timeout: 123 });
+  });
+
+  it("does not fail validation when only the legacy raw timeline fallback is available", async () => {
+    const page = {
+      waitForFunction: vi.fn(async () => {
+        throw new Error("waiting failed: timeout");
+      }),
+    };
+
+    await expect(waitForPreferredSeekTarget(page, 1)).resolves.toBeUndefined();
+  });
+
+  it("does not fail validation when the page stub throws synchronously", async () => {
+    const page = {
+      waitForFunction: vi.fn(() => {
+        throw new Error("waiting failed synchronously");
+      }),
+    };
+
+    await expect(waitForPreferredSeekTarget(page, 1)).resolves.toBeUndefined();
+  });
+});
+
 describe("extractCompositionErrorsFromLint", () => {
   // `bundleToSingleHtml` (the inliner validate.ts bundles through) is
   // intentionally tolerant of missing/empty/unparsable data-composition-src
@@ -104,6 +246,7 @@ describe("extractCompositionErrorsFromLint", () => {
       results: [
         {
           file: "index.html",
+          contentHash: "test",
           result: {
             ok: findings.length === 0,
             errorCount: 0,
@@ -154,6 +297,7 @@ describe("extractCompositionErrorsFromLint", () => {
       results: [
         {
           file: "index.html",
+          contentHash: "test",
           result: {
             ok: false,
             errorCount: 1,
@@ -170,6 +314,7 @@ describe("extractCompositionErrorsFromLint", () => {
         },
         {
           file: "compositions/nested.html",
+          contentHash: "test",
           result: {
             ok: false,
             errorCount: 1,
@@ -190,5 +335,76 @@ describe("extractCompositionErrorsFromLint", () => {
     const errors = extractCompositionErrorsFromLint(lintResult);
     expect(errors).toHaveLength(2);
     expect(errors.map((e) => e.text)).toEqual(["scene-a is empty", "scene-b is empty"]);
+  });
+});
+
+// Regression: `validate` used a hardcoded 10s page-navigation timeout that
+// ignored --timeout, so a composition loading GSAP from a CDN <script> (which
+// blocks domcontentloaded) failed with an opaque "Navigation timeout of 10000ms"
+// even though the full render's larger budget rode it out — with no knob to
+// extend it. resolveNavigationTimeoutMs makes --timeout raise the nav budget
+// (never below the 10s floor); navigationTimeoutHint replaces the opaque error.
+describe("resolveNavigationTimeoutMs", () => {
+  it("keeps the 10s floor when --timeout is unset or smaller", () => {
+    expect(resolveNavigationTimeoutMs(undefined)).toBe(10000);
+    expect(resolveNavigationTimeoutMs(3000)).toBe(10000); // the default --timeout
+    expect(resolveNavigationTimeoutMs(0)).toBe(10000);
+  });
+
+  it("raises the navigation budget to --timeout when it exceeds the floor", () => {
+    expect(resolveNavigationTimeoutMs(30000)).toBe(30000);
+  });
+});
+
+describe("navigationTimeoutHint", () => {
+  it("replaces a Puppeteer navigation-timeout error with an actionable CDN/--timeout hint", () => {
+    const hinted = navigationTimeoutHint(
+      new Error("Navigation timeout of 10000 ms exceeded"),
+      10000,
+    );
+    expect(hinted).toBeInstanceOf(Error);
+    expect(hinted?.message).toContain("10000ms");
+    expect(hinted?.message).toContain("CDN");
+    expect(hinted?.message).toContain("--timeout");
+  });
+
+  it("returns null for any non-navigation-timeout error so the caller rethrows it as-is", () => {
+    expect(navigationTimeoutHint(new Error("net::ERR_CONNECTION_REFUSED"), 10000)).toBeNull();
+    expect(navigationTimeoutHint("some string failure", 10000)).toBeNull();
+  });
+});
+
+describe("validate command deprecation (U5)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("marks the command description as deprecated", async () => {
+    const { default: validateCommand } = await import("./validate.js");
+    expect(metaDescription(validateCommand)).toContain("(deprecated, use check)");
+  });
+
+  it("prints a one-line deprecation notice to stderr and never to stdout", async () => {
+    const { default: validateCommand } = await import("./validate.js");
+    const { stderrText, stdoutText } = await runAndCaptureStdio(validateCommand);
+    expect(stderrText).toContain("hyperframes validate");
+    expect(stderrText).toContain("hyperframes check");
+    expect(stdoutText).toBe("");
+  });
+
+  it("--json output is valid JSON with _meta.deprecated === true on failure", async () => {
+    const { default: validateCommand } = await import("./validate.js");
+    const { parsed } = await runAndParseJsonEnvelope(validateCommand);
+    expect(parsed.ok).toBe(false);
+    expect(parsed._meta.deprecated).toBe(true);
+  });
+});
+
+describe("projectPathOfUrl", () => {
+  it("names a file with a bare percent sign instead of throwing", () => {
+    expect(projectPathOfUrl("http://127.0.0.1:4000/assets/50%.png")).toBe("assets/50%.png");
+    expect(projectPathOfUrl("http://127.0.0.1:4000/assets/50%25%20off.png")).toBe(
+      "assets/50% off.png",
+    );
   });
 });

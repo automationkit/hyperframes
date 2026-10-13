@@ -40,6 +40,40 @@ export function renderObservabilityTelemetryPayload(
     capturePlayerReadyTimeoutMs: capture.playerReadyTimeoutMs,
     captureTransientRetries: capture.transientRetries,
     captureMemoryExhaustionDetected: capture.memoryExhaustionDetected,
+    captureDeWorkerInversion: capture.deWorkerInversion,
+    captureDePreInversionWorkers: capture.dePreInversionWorkers,
+    captureCompositionElementCount: capture.compositionElementCount,
+    captureCompositionElementCountSource: capture.compositionElementCountSource,
+    captureCompositionElementTags: capture.compositionElementTags,
+    captureArollVideoCount: capture.arollVideoCount,
+    captureHeygenVideoCount: capture.heygenVideoCount,
+    captureAdaptersUsed: capture.adaptersUsed,
+    captureAudioCount: capture.audioCount,
+    captureImageCount: capture.imageCount,
+    captureSubCompositionCount: capture.subCompositionCount,
+    captureAudioGroupCount: capture.audioGroupCount,
+    captureColorGradingCount: capture.colorGradingCount,
+    captureHasLut: capture.hasLut,
+    captureRootBodyMismatch: capture.rootBodyMismatch,
+    captureRootBodyDeltaPxBucket: capture.rootBodyDeltaPxBucket,
+    captureDeShortBand: capture.deShortBand,
+    captureDeParallelRouter: capture.deParallelRouter,
+    captureDeGpuRenderer: capture.deGpuRenderer,
+    captureDePreRouterWorkers: capture.dePreRouterWorkers,
+    captureDeSelfVerifyFallback: capture.deSelfVerifyFallback,
+    captureDeFallbackReason: capture.deFallbackReason,
+    captureDeFallbackFailedDb: capture.deFallbackFailedDb,
+    captureDeFallbackFrameIndex: capture.deFallbackFrameIndex,
+    captureDeFallbackThresholdDb: capture.deFallbackThresholdDb,
+    captureParallelStream: capture.captureParallelStream,
+    captureChromeBrowserRssPeakMb: capture.chromeBrowserRssPeakMb,
+    captureChromeRendererRssPeakMb: capture.chromeRendererRssPeakMb,
+    captureChromeRssLastMb: capture.chromeRssLastMb,
+    captureChromeGpuProcessSeenLastSample: capture.chromeGpuProcessSeenLastSample,
+    captureChromeMemorySamples: capture.chromeMemorySamples,
+    captureCapturePath: capture.capturePath,
+    captureSegmentIndex: capture.segmentIndex,
+    captureSegmentRetries: capture.segmentRetries,
     observabilityExtractVideoCount: extraction?.videoCount,
     observabilityExtractedVideoCount: extraction?.extractedVideoCount,
     observabilityExtractTotalFrames: extraction?.totalFramesExtracted,
@@ -52,13 +86,17 @@ export function renderObservabilityTelemetryPayload(
     observabilityExtractCacheMisses: extraction?.cacheMisses,
     observabilityInitDurationMs: init?.initDurationMs,
     observabilityInitTweenCount: init?.tweenCount,
+    observabilityInitElementCount: init?.elementCount,
   };
 }
 
 export function renderJobObservabilityTelemetryPayload(
   job: RenderJob | undefined,
 ): RenderObservabilityTelemetryPayload {
-  return renderObservabilityTelemetryPayload(
-    job?.errorDetails?.observability ?? job?.perfSummary?.observability,
-  );
+  return {
+    ...renderObservabilityTelemetryPayload(
+      job?.errorDetails?.observability ?? job?.perfSummary?.observability,
+    ),
+    subTimelineWait: job?.errorDetails?.subTimelineWait ?? job?.perfSummary?.subTimelineWait,
+  };
 }

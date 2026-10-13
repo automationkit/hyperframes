@@ -1,28 +1,28 @@
+import { buildProjectApiPath } from "../utils/projectRouting";
 import { useCallback } from "react";
-import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
-import { createStudioSaveHttpError } from "../utils/studioSaveDiagnostics";
-import { buildDomEditPatchTarget, type DomEditSelection } from "../components/editor/domEditing";
-import type { EditHistoryKind } from "../utils/editHistory";
+import {
+  saveServerRewriteWithHistory,
+  type DomEditCommitBaseParams,
+} from "../utils/studioFileHistory";
+import {
+  buildDomEditPatchTarget,
+  readHfId,
+  type DomEditSelection,
+} from "../components/editor/domEditing";
+import { studioWriteHeaders } from "../utils/studioFileVersion";
+import {
+  findMatchingTimelineElementId,
+  resolveElementTrack,
+  type ElementMatchSelection,
+} from "../utils/studioHelpers";
+import type { TimelineElement } from "../player";
+import { studioApiFetch } from "../utils/studioApiFetch";
 
-interface RecordEditInput {
-  label: string;
-  kind: EditHistoryKind;
-  coalesceKey?: string;
-  files: Record<string, { before: string; after: string }>;
-}
-
-interface UseGroupCommitsParams {
-  activeCompPath: string | null;
-  showToast: (message: string, tone?: "error" | "info") => void;
-  writeProjectFile: (path: string, content: string) => Promise<void>;
-  domEditSaveTimestampRef: React.MutableRefObject<number>;
-  editHistory: { recordEdit: (entry: RecordEditInput) => Promise<void> };
-  projectIdRef: React.MutableRefObject<string | null>;
-  reloadPreview: () => void;
-  clearDomSelection: () => void;
+interface UseGroupCommitsParams extends DomEditCommitBaseParams {
   /** Resync the SDK session after a server-side write (the wrapper/unwrap changes
    * structure the in-memory doc doesn't know about). */
   forceReloadSdkSession?: () => void;
+  timelineElements: TimelineElement[];
 }
 
 interface PatchTarget {
@@ -35,7 +35,21 @@ interface PatchTarget {
 interface GroupGeometry {
   bbox: { left: number; top: number; width: number; height: number };
   targets: PatchTarget[];
-  rebases: Array<{ target: PatchTarget; left: number; top: number }>;
+  rebases: Array<{ target: PatchTarget; left: number; top: number; track?: number }>;
+}
+
+// The member's current resolved track (authored, or the runtime's positional-
+// index fallback). Threaded through so the server can stamp it explicitly —
+// same hazard and fix as the razor split.
+function resolveAuthoredTrack(
+  selection: ElementMatchSelection,
+  timelineElements: TimelineElement[],
+): number | undefined {
+  const id = findMatchingTimelineElementId(selection, timelineElements);
+  if (!id) return undefined;
+  const match = timelineElements.find((el) => (el.key ?? el.id) === id);
+  if (!match) return undefined;
+  return resolveElementTrack(match);
 }
 
 // Wrapper sits at the members' bounding box top-left; each member is rebased so
@@ -43,13 +57,17 @@ interface GroupGeometry {
 // composition space (transforms excluded), exactly the space the rebase formula
 // `left_new = left_old - W.left` operates in — GSAP x/y and offset vars are
 // transform deltas and stay correct without adjustment.
-function computeGroupGeometry(members: DomEditSelection[]): GroupGeometry {
+export function computeGroupGeometry(
+  members: DomEditSelection[],
+  timelineElements: TimelineElement[],
+): GroupGeometry {
   const boxes = members.map((m) => ({
     target: buildDomEditPatchTarget(m),
     left: m.element.offsetLeft,
     top: m.element.offsetTop,
     right: m.element.offsetLeft + m.element.offsetWidth,
     bottom: m.element.offsetTop + m.element.offsetHeight,
+    track: resolveAuthoredTrack(m, timelineElements),
   }));
   const left = Math.min(...boxes.map((b) => b.left));
   const top = Math.min(...boxes.map((b) => b.top));
@@ -58,8 +76,35 @@ function computeGroupGeometry(members: DomEditSelection[]): GroupGeometry {
   return {
     bbox: { left, top, width, height },
     targets: boxes.map((b) => b.target),
-    rebases: boxes.map((b) => ({ target: b.target, left: b.left - left, top: b.top - top })),
+    rebases: boxes.map((b) => ({
+      target: b.target,
+      left: b.left - left,
+      top: b.top - top,
+      track: b.track,
+    })),
   };
+}
+
+// Ungroup re-derives each child's track from the raw DOM (no DomEditSelection
+// exists per child); matches by id, falling back to hfId for a child with no
+// authored id. A child with neither keeps its current track, unstamped.
+export function resolveGroupChildTracks(
+  group: DomEditSelection,
+  timelineElements: TimelineElement[],
+): Array<{ target: PatchTarget; track?: number }> {
+  const sourceFile = group.sourceFile || "index.html";
+  const result: Array<{ target: PatchTarget; track?: number }> = [];
+  for (const child of Array.from(group.element.children)) {
+    const id = (child as HTMLElement).id || undefined;
+    const hfId = readHfId(child);
+    if (!id && !hfId) continue;
+    const track = resolveAuthoredTrack(
+      { id, hfId, sourceFile, isCompositionHost: false },
+      timelineElements,
+    );
+    result.push({ target: buildDomEditPatchTarget({ id, hfId }), track });
+  }
+  return result;
 }
 
 // Shared read → mutate-route → save-with-history → reload pipeline for both
@@ -75,56 +120,45 @@ async function commitStructuralMutation(
     UseGroupCommitsParams,
     | "writeProjectFile"
     | "editHistory"
-    | "domEditSaveTimestampRef"
     | "clearDomSelection"
     | "forceReloadSdkSession"
     | "reloadPreview"
   >,
 ): Promise<{ content?: string; groupId?: string }> {
-  const response = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`);
-  if (!response.ok) {
-    throw await createStudioSaveHttpError(response, `Failed to read ${targetPath}`);
-  }
-  const data = (await response.json()) as { content?: string };
-  const originalContent = data.content;
-  if (typeof originalContent !== "string") {
-    throw new Error(`Missing file contents for ${targetPath}`);
-  }
-
-  deps.domEditSaveTimestampRef.current = Date.now();
-  const mutateResponse = await fetch(
-    `/api/projects/${pid}/file-mutations/${route}/${encodeURIComponent(targetPath)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
-  if (!mutateResponse.ok) {
-    const errBody = (await mutateResponse.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(errBody?.error ?? `Failed to ${label.toLowerCase()} in ${targetPath}`);
-  }
-  const mutateData = (await mutateResponse.json()) as { content?: string; groupId?: string };
-  const patchedContent =
-    typeof mutateData.content === "string" ? mutateData.content : originalContent;
-
-  await saveProjectFilesWithHistory({
+  let result: { content?: string; groupId?: string } = {};
+  await saveServerRewriteWithHistory({
     projectId: pid,
+    path: targetPath,
     label,
-    kind: "manual",
-    files: { [targetPath]: patchedContent },
-    readFile: async () => originalContent,
     writeFile: deps.writeProjectFile,
     recordEdit: deps.editHistory.recordEdit,
+    rewrite: async (originalContent) => {
+      const mutateResponse = await studioApiFetch(
+        buildProjectApiPath(pid, `/file-mutations/${route}/${encodeURIComponent(targetPath)}`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!mutateResponse.ok) {
+        const errBody = (await mutateResponse.json().catch(() => null)) as {
+          error?: string;
+        } | null;
+        throw new Error(errBody?.error ?? `Failed to ${label.toLowerCase()} in ${targetPath}`);
+      }
+      result = (await mutateResponse.json()) as { content?: string; groupId?: string };
+      return { disk: typeof result.content === "string" ? result.content : originalContent };
+    },
   });
   deps.clearDomSelection();
   deps.forceReloadSdkSession?.();
   deps.reloadPreview();
-  return mutateData;
+  return result;
 }
 
 export function useGroupCommits(params: UseGroupCommitsParams) {
-  const { activeCompPath, showToast, projectIdRef } = params;
+  const { activeCompPath, showToast, projectIdRef, timelineElements } = params;
 
   const groupSelection = useCallback(
     async (members: DomEditSelection[]): Promise<string | null> => {
@@ -142,7 +176,7 @@ export function useGroupCommits(params: UseGroupCommitsParams) {
       // Auto-name "Group N" by the count of existing groups in the document.
       const doc = members[0].element.ownerDocument;
       const groupId = `Group ${doc.querySelectorAll("[data-hf-group]").length + 1}`;
-      const { bbox, targets, rebases } = computeGroupGeometry(members);
+      const { bbox, targets, rebases } = computeGroupGeometry(members, timelineElements);
 
       try {
         const data = await commitStructuralMutation(
@@ -159,7 +193,7 @@ export function useGroupCommits(params: UseGroupCommitsParams) {
         return null;
       }
     },
-    [activeCompPath, projectIdRef, showToast, params],
+    [activeCompPath, projectIdRef, showToast, params, timelineElements],
   );
 
   const ungroupSelection = useCallback(
@@ -167,13 +201,14 @@ export function useGroupCommits(params: UseGroupCommitsParams) {
       const pid = projectIdRef.current;
       if (!pid) return;
       const targetPath = group.sourceFile || activeCompPath || "index.html";
+      const childTracks = resolveGroupChildTracks(group, timelineElements);
 
       try {
         await commitStructuralMutation(
           pid,
           targetPath,
           "unwrap-elements",
-          { target: buildDomEditPatchTarget(group) },
+          { target: buildDomEditPatchTarget(group), childTracks },
           "Ungroup elements",
           params,
         );
@@ -181,7 +216,7 @@ export function useGroupCommits(params: UseGroupCommitsParams) {
         showToast(error instanceof Error ? error.message : "Failed to ungroup elements", "error");
       }
     },
-    [activeCompPath, projectIdRef, showToast, params],
+    [activeCompPath, projectIdRef, showToast, params, timelineElements],
   );
 
   return { groupSelection, ungroupSelection };

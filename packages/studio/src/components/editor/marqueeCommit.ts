@@ -1,10 +1,14 @@
-import { useCallback, useRef, useState } from "react";
+import type { DomSelectionResult } from "../../hooks/useDomSelectionTypes";
+import { trackPreviewFeatureUsed } from "../../utils/previewFeatureUsage";
+// fallow-ignore-file code-duplication
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DomEditSelection } from "./domEditing";
 import { collectDomEditLayerItems, resolveDomEditSelection } from "./domEditingLayers";
 import { isElementComputedVisible } from "./domEditingElement";
 import { coversComposition } from "../../utils/studioPreviewHelpers";
 import { rectsOverlap, type Rect } from "../../utils/marqueeGeometry";
-import { toOverlayRect } from "./domEditOverlayGeometry";
+import { toVisibleOverlayRect } from "./domEditOverlayGeometry";
+import { movesGesture } from "./domEditOverlayGestures";
 
 interface MarqueeState {
   startX: number;
@@ -13,6 +17,17 @@ interface MarqueeState {
   currentY: number;
   pointerId: number;
   pastThreshold: boolean;
+  target: Element;
+}
+
+function currentMarqueeCandidates(
+  cached: MarqueeHit[] | null,
+  iframe: HTMLIFrameElement,
+  overlay: HTMLDivElement,
+  path: string,
+): MarqueeHit[] {
+  if (cached?.every((hit) => hit.element.ownerDocument === iframe.contentDocument)) return cached;
+  return collectMarqueeCandidates(iframe, overlay, path);
 }
 
 const MARQUEE_THRESHOLD_PX = 4;
@@ -23,16 +38,18 @@ interface MarqueeHit {
 }
 
 /**
- * Synchronous core of the marquee: the elements whose overlay-space rect
- * intersects the marquee rect. Uses the SAME `toOverlayRect` basis as the
- * single-selection / group-selection boxes, so what the marquee highlights
- * and selects is exactly the box the user sees when they click an element.
- * Shared by the live candidate highlight (per pointer-move) and the mouse-up
- * commit. No async source probe — that only happens once, on commit.
+ * Every element the marquee could hit, with the overlay-space rect it would be
+ * tested against. Uses the SAME `toOverlayRect` basis as the single-selection /
+ * group-selection boxes, so what the marquee highlights and selects is exactly
+ * the box the user sees when they click an element.
+ *
+ * Measured once per drag rather than per pointer-move: this reads layout for
+ * every element in the document, and a captured page has enough of them that
+ * doing it 60 times a second stalls the tab. The iframe DOM does not mutate
+ * mid-drag, so the rects it returns stay true for the whole gesture.
  */
 // fallow-ignore-next-line complexity
-function collectMarqueeHits(
-  rect: Rect,
+function collectMarqueeCandidates(
   iframe: HTMLIFrameElement,
   overlayEl: HTMLDivElement,
   activeCompositionPath: string,
@@ -52,35 +69,38 @@ function collectMarqueeHits(
     height: declH > 0 ? declH : rootEl.getBoundingClientRect().height || 1,
   };
 
-  const hits: MarqueeHit[] = [];
+  const candidates: MarqueeHit[] = [];
   for (const item of items) {
     const el = item.element;
     if (!isElementComputedVisible(el)) continue;
     if (coversComposition(el.getBoundingClientRect(), viewport)) continue;
-    const overlayRect = toOverlayRect(overlayEl, iframe, el);
+    const overlayRect = toVisibleOverlayRect(overlayEl, iframe, el);
     if (!overlayRect) continue;
-    const r: Rect = {
-      left: overlayRect.left,
-      top: overlayRect.top,
-      width: overlayRect.width,
-      height: overlayRect.height,
-    };
-    if (!rectsOverlap(rect, r)) continue;
-    hits.push({ element: el, rect: r });
+    candidates.push({
+      element: el,
+      rect: {
+        left: overlayRect.left,
+        top: overlayRect.top,
+        width: overlayRect.width,
+        height: overlayRect.height,
+      },
+    });
   }
 
-  return hits;
+  return candidates;
 }
 
-async function runMarqueeIntersection(
-  rect: Rect,
-  iframe: HTMLIFrameElement,
-  overlayEl: HTMLDivElement,
+function hitsWithin(rect: Rect, candidates: MarqueeHit[]): MarqueeHit[] {
+  return candidates.filter((candidate) => rectsOverlap(rect, candidate.rect));
+}
+
+async function resolveDomEditSelections(
+  elements: HTMLElement[],
   activeCompositionPath: string,
 ): Promise<DomEditSelection[]> {
   const isMasterView = !activeCompositionPath || activeCompositionPath === "index.html";
   const hits: DomEditSelection[] = [];
-  for (const { element } of collectMarqueeHits(rect, iframe, overlayEl, activeCompositionPath)) {
+  for (const element of elements) {
     const sel = await resolveDomEditSelection(element, {
       activeCompositionPath,
       isMasterView,
@@ -91,23 +111,54 @@ async function runMarqueeIntersection(
   return hits;
 }
 
-interface MarqueeGesturesDeps {
+export interface MarqueeGesturesDeps<T = DomEditSelection> {
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
   overlayRef: React.RefObject<HTMLDivElement | null>;
   activeCompositionPathRef: React.RefObject<string | null>;
   onMarqueeSelectRef: React.RefObject<
-    ((selections: DomEditSelection[], additive: boolean) => void) | undefined
+    ((selections: T[], additive: boolean) => DomSelectionResult | void) | undefined
   >;
-  selectionRef: React.RefObject<DomEditSelection | null>;
-  gestures: {
+  /** Turns the elements a drag touched into picks; without it, Studio's edit selections. */
+  resolveHits?: (elements: HTMLElement[]) => T[] | Promise<T[]>;
+  selectionRef?: React.RefObject<DomEditSelection | null>;
+  /** Studio's pointer handling, for the events that are not part of a marquee. */
+  gestures?: {
     onPointerMove: (event: React.PointerEvent<HTMLDivElement>) => void;
     onPointerUp: (event: React.PointerEvent<HTMLDivElement>) => void;
     clearPointerState: (ref: React.RefObject<DomEditSelection | null>) => void;
   };
 }
 
+export interface MarqueeGestures {
+  marqueeRect: Rect | null;
+  candidateRects: Rect[];
+  /** Starts a marquee at this press; the host has decided it landed on empty canvas. */
+  begin: (event: React.PointerEvent<HTMLElement>) => void;
+  /** Drops an active marquee without selecting anything. */
+  cancel: () => void;
+  onPointerMove: (event: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerUp: (event: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerCancel: () => void;
+}
+
+function trackMarqueeSelection(result: DomSelectionResult | void): void {
+  if (result?.changed && result.count > 1) trackPreviewFeatureUsed("multi_select", "drag");
+}
+
+function releaseCapture(m: MarqueeState): void {
+  try {
+    m.target.releasePointerCapture(m.pointerId);
+  } catch {
+    /* already released */
+  }
+}
+
+export function useMarqueeGestures(deps: MarqueeGesturesDeps): MarqueeGestures;
+export function useMarqueeGestures<T>(
+  deps: MarqueeGesturesDeps<T> & Required<Pick<MarqueeGesturesDeps<T>, "resolveHits">>,
+): MarqueeGestures;
 // fallow-ignore-next-line complexity
-export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
+export function useMarqueeGestures<T>(deps: MarqueeGesturesDeps<T>): MarqueeGestures {
   const marqueeRef = useRef<MarqueeState | null>(null);
   const [marqueeRect, setMarqueeRect] = useState<Rect | null>(null);
   // Live "candidate" highlight: the elements the marquee currently touches,
@@ -115,6 +166,8 @@ export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
   // iframe DOM doesn't mutate during a drag, so a sync intersection per move
   // is cheap (clean layout → no thrash).
   const [candidateRects, setCandidateRects] = useState<Rect[]>([]);
+  // Measured once when the drag passes the threshold and reused until it ends.
+  const candidatesRef = useRef<MarqueeHit[] | null>(null);
 
   const commitMarquee = useCallback(
     async (
@@ -125,16 +178,88 @@ export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
       const overlay = deps.overlayRef.current;
       if (!iframe || !overlay || !deps.onMarqueeSelectRef.current) return;
       const acp = deps.activeCompositionPathRef.current ?? "index.html";
-      const hits = await runMarqueeIntersection(rect, iframe, overlay, acp);
-      deps.onMarqueeSelectRef.current(hits, additive);
+      const candidates = currentMarqueeCandidates(candidatesRef.current, iframe, overlay, acp);
+      const elements = hitsWithin(rect, candidates).map((hit) => hit.element);
+      const resolveHits = deps.resolveHits;
+      const picks = resolveHits
+        ? await resolveHits(elements)
+        : ((await resolveDomEditSelections(elements, acp)) as T[]);
+      const applySelection = deps.onMarqueeSelectRef.current;
+      if (!applySelection) return;
+      const result = applySelection(picks, additive);
+      trackMarqueeSelection(result);
     },
-    [deps.iframeRef, deps.overlayRef, deps.onMarqueeSelectRef, deps.activeCompositionPathRef],
+    [
+      deps.iframeRef,
+      deps.overlayRef,
+      deps.onMarqueeSelectRef,
+      deps.activeCompositionPathRef,
+      deps.resolveHits,
+    ],
+  );
+
+  const reset = useCallback(() => {
+    marqueeRef.current = null;
+    setMarqueeRect(null);
+    setCandidateRects([]);
+    candidatesRef.current = null;
+  }, []);
+
+  const begin = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      const oRect = deps.overlayRef.current?.getBoundingClientRect();
+      if (!oRect) return;
+      event.currentTarget.setPointerCapture(event.pointerId);
+      const x = event.clientX - oRect.left;
+      const y = event.clientY - oRect.top;
+      marqueeRef.current = {
+        startX: x,
+        startY: y,
+        currentX: x,
+        currentY: y,
+        pointerId: event.pointerId,
+        pastThreshold: false,
+        target: event.currentTarget,
+      };
+    },
+    [deps.overlayRef],
+  );
+
+  const cancel = useCallback(() => {
+    if (!marqueeRef.current) return;
+    releaseCapture(marqueeRef.current);
+    reset();
+  }, [reset]);
+
+  useEffect(() => {
+    const cancelBandBeforeHostEscape = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || !marqueeRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      cancel();
+    };
+    window.addEventListener("keydown", cancelBandBeforeHostEscape, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", cancelBandBeforeHostEscape, { capture: true });
+  }, [cancel]);
+
+  const showCandidates = useCallback(
+    (rect: Rect) => {
+      const iframe = deps.iframeRef.current;
+      const overlay = deps.overlayRef.current;
+      if (!iframe || !overlay) return;
+      const acp = deps.activeCompositionPathRef.current ?? "index.html";
+      candidatesRef.current ??= collectMarqueeCandidates(iframe, overlay, acp);
+      setCandidateRects(hitsWithin(rect, candidatesRef.current).map((h) => h.rect));
+    },
+    [deps.overlayRef, deps.iframeRef, deps.activeCompositionPathRef],
   );
 
   const onPointerMove = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       const m = marqueeRef.current;
       if (m) {
+        if (!movesGesture(m, event)) return;
         const oRect = deps.overlayRef.current?.getBoundingClientRect();
         if (!oRect) return;
         m.currentX = event.clientX - oRect.left;
@@ -144,6 +269,7 @@ export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
           const dy = m.currentY - m.startY;
           if (Math.hypot(dx, dy) < MARQUEE_THRESHOLD_PX) return;
           m.pastThreshold = true;
+          candidatesRef.current = null;
         }
         const rect: Rect = {
           left: Math.min(m.startX, m.currentX),
@@ -152,29 +278,19 @@ export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
           height: Math.abs(m.currentY - m.startY),
         };
         setMarqueeRect(rect);
-        const iframe = deps.iframeRef.current;
-        const overlay = deps.overlayRef.current;
-        if (iframe && overlay) {
-          const acp = deps.activeCompositionPathRef.current ?? "index.html";
-          setCandidateRects(collectMarqueeHits(rect, iframe, overlay, acp).map((h) => h.rect));
-        }
+        showCandidates(rect);
         return;
       }
-      deps.gestures.onPointerMove(event);
+      deps.gestures?.onPointerMove(event);
     },
-    [deps.gestures, deps.overlayRef, deps.iframeRef, deps.activeCompositionPathRef],
+    [deps.gestures, deps.overlayRef, showCandidates],
   );
 
   const onPointerUp = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       const m = marqueeRef.current;
       if (m) {
-        marqueeRef.current = null;
-        try {
-          (event.currentTarget as HTMLElement).releasePointerCapture(m.pointerId);
-        } catch {
-          /* already released */
-        }
+        releaseCapture(m);
         if (m.pastThreshold) {
           commitMarquee(
             {
@@ -188,24 +304,26 @@ export function useMarqueeGestures(deps: MarqueeGesturesDeps) {
         } else {
           deps.onMarqueeSelectRef.current?.([], false);
         }
-        setMarqueeRect(null);
-        setCandidateRects([]);
+        reset();
         return;
       }
-      deps.gestures.onPointerUp(event);
+      deps.gestures?.onPointerUp(event);
     },
-    [deps.gestures, commitMarquee, deps.onMarqueeSelectRef],
+    [deps.gestures, commitMarquee, deps.onMarqueeSelectRef, reset],
   );
 
   const onPointerCancel = useCallback(() => {
-    if (marqueeRef.current) {
-      marqueeRef.current = null;
-      setMarqueeRect(null);
-      setCandidateRects([]);
-      return;
-    }
-    deps.gestures.clearPointerState(deps.selectionRef);
-  }, [deps.gestures, deps.selectionRef]);
+    if (marqueeRef.current) return cancel();
+    if (deps.selectionRef) deps.gestures?.clearPointerState(deps.selectionRef);
+  }, [deps.gestures, deps.selectionRef, cancel]);
 
-  return { marqueeRef, marqueeRect, candidateRects, onPointerMove, onPointerUp, onPointerCancel };
+  return {
+    marqueeRect,
+    candidateRects,
+    begin,
+    cancel,
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel,
+  };
 }

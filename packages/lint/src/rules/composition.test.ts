@@ -1,7 +1,71 @@
+// fallow-ignore-file code-duplication
 import { describe, it, expect } from "vitest";
 import { lintHyperframeHtml } from "../hyperframeLinter.js";
 
 describe("composition rules", () => {
+  describe("canonical timing contract", () => {
+    it("rejects deprecated attributes even when canonical attributes are also present", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-start="0" data-duration="5">
+          <div class="clip" data-start="1" data-duration="2" data-end="9" data-track-index="1" data-layer="4"></div>
+        </div>
+      </body></html>`);
+
+      expect(result.findings.map(({ code }) => code)).toEqual(
+        expect.arrayContaining(["deprecated_data_end", "deprecated_data_layer"]),
+      );
+    });
+
+    it("uses canonical timing when deprecated attributes conflict", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-start="0" data-duration="5">
+          <div id="a" class="clip" data-start="0" data-duration="2" data-end="9" data-track-index="1"></div>
+          <div id="b" class="clip" data-start="2" data-duration="2" data-track-index="1"></div>
+        </div>
+      </body></html>`);
+
+      expect(
+        result.findings.find(({ code }) => code === "overlapping_clips_same_track"),
+      ).toBeUndefined();
+    });
+
+    // Regression: cli-feedback field cluster (crons 61-68, n=25+ across
+    // darwin/linux/win32 and versions 0.7.56-0.7.64). `bundleToSingleHtml`
+    // compiles `data-duration` into `data-end`, then re-validates the compiled
+    // HTML. Before this fix the linter fired `deprecated_data_end` on the
+    // compiler's own consistent output — a false-positive that reporters
+    // routed as "check --strict passes but StaticGuard still logs
+    // deprecated-attribute noise" (ts=1784548892, ts=1784541122).
+    it("does not flag deprecated_data_end when compiled data-end matches data-duration", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="30">
+          <audio id="bgm" src="bgm.mp3" data-start="0" data-duration="18" data-end="18"></audio>
+          <audio id="narration" src="narr.mp3" data-start="5" data-duration="10" data-end="15"></audio>
+        </div>
+        <script>window.__timelines = { main: {} };</script>
+      </body></html>`);
+
+      const deprecatedEnd = result.findings.filter(({ code }) => code === "deprecated_data_end");
+      expect(deprecatedEnd).toEqual([]);
+    });
+
+    // Companion regression: a manually authored stale `data-end` still fires
+    // `deprecated_data_end`, with a message that names the disagreement so
+    // the author can spot the drift rather than reading the legacy phrasing.
+    it("still flags deprecated_data_end when data-end disagrees with data-duration", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="30">
+          <audio id="bgm" src="bgm.mp3" data-start="0" data-duration="18" data-end="20"></audio>
+        </div>
+        <script>window.__timelines = { main: {} };</script>
+      </body></html>`);
+
+      const deprecatedEnd = result.findings.find(({ code }) => code === "deprecated_data_end");
+      expect(deprecatedEnd).toBeDefined();
+      expect(deprecatedEnd?.message).toMatch(/disagrees with data-duration/);
+    });
+  });
+
   describe("subcomposition guidance", () => {
     it("warns when any HTML composition file is over 300 lines", async () => {
       const html = Array.from({ length: 301 }, (_, i) =>
@@ -172,6 +236,22 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
+    it("does not count transcript caption cues as dense track elements", async () => {
+      const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1080" data-height="1920" data-start="0">
+    <div class="caption-group clip" data-start="0" data-duration="1" data-track-index="2">一</div>
+    <div class="caption-line clip" data-start="1" data-duration="1" data-track-index="2">二</div>
+    <div class="caption_block clip" data-start="2" data-duration="1" data-track-index="2">三</div>
+    <div class="cg-4 clip" data-start="3" data-duration="1" data-track-index="2">四</div>
+  </div>
+</body></html>`;
+
+      const result = await lintHyperframeHtml(html, { filePath: "/project/index.html" });
+      const finding = result.findings.find((f) => f.code === "timeline_track_too_dense");
+      expect(finding).toBeUndefined();
+    });
+
     it("does not count root composition or mounted sub-compositions as dense elements", async () => {
       const html = `<!DOCTYPE html>
 <html><body>
@@ -186,6 +266,133 @@ describe("composition rules", () => {
       const result = await lintHyperframeHtml(html, { filePath: "/project/index.html" });
       const finding = result.findings.find((f) => f.code === "timeline_track_too_dense");
       expect(finding).toBeUndefined();
+    });
+  });
+
+  describe("duplicate_composition_id", () => {
+    it("flags a meta tag and root div sharing the same data-composition-id", async () => {
+      const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta name="composition-id" data-composition-id="x">
+</head>
+<body>
+  <div data-composition-id="x" data-width="1920" data-height="1080" data-start="0" data-duration="1" data-no-timeline></div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+    });
+
+    it("does not flag a single valid composition id", async () => {
+      const html = `<!DOCTYPE html>
+<html>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="1" data-no-timeline></div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not flag distinct composition ids in one file", async () => {
+      const html = `<!DOCTYPE html>
+<html>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5" data-no-timeline>
+    <div data-composition-id="scene" data-composition-src="compositions/scene.html" data-start="0" data-duration="5"></div>
+  </div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not flag one sub-composition mounted repeatedly with per-instance values", async () => {
+      // Regression: sub-compositions.md "Per-Instance Variables" documents
+      // mounting one source several times with different data-variable-values.
+      // That necessarily repeats the id, and the runtime rewrites repeated
+      // mounts to `id__hf1`/`id__hf2` so they coexist. Flagging it made the
+      // documented pattern an error with no correct way to satisfy it.
+      const html = `<!DOCTYPE html>
+<html>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="6" data-no-timeline>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"one"}' data-start="0" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"two"}' data-start="2" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"three"}' data-start="4" data-duration="2"></div>
+  </div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "duplicate_composition_id")).toBeUndefined();
+    });
+
+    it("still flags a real collision between a root and a non-mount element", async () => {
+      // The guard that keeps the exemption honest: skipping mounts must not
+      // blind the rule to the meta-versus-root collision it exists for, even
+      // when a legitimately repeated mount is present in the same file.
+      const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta name="composition-id" data-composition-id="main">
+</head>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="4" data-no-timeline>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-start="0" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-start="2" data-duration="2"></div>
+  </div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeDefined();
+      expect(finding?.message).toContain("main");
+    });
+
+    it("ignores composition ids inside inert template content", async () => {
+      const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="1" data-no-timeline></div>
+  <template><div data-composition-id="main"></div></template>
+</body></html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeUndefined();
+    });
+
+    it("flags entity-equivalent composition ids", async () => {
+      const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="1" data-no-timeline></div>
+  <meta data-composition-id="&#109;ain">
+</body></html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeDefined();
+    });
+
+    it("uses the browser's first value for duplicate attributes", async () => {
+      const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="1" data-no-timeline></div>
+  <meta data-composition-id="main" data-composition-id="other">
+</body></html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeDefined();
     });
   });
 
@@ -267,6 +474,94 @@ describe("composition rules", () => {
     expect(findings[0]?.fixHint).toContain('[data-composition-id="scene"][data-start="0"]');
   });
 
+  it("keeps reporting a missing duration source when the same script defeats the lexer", async () => {
+    const html = `
+<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    var of = 2; var r = of /2;
+    // window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html, { filePath: "compositions/main.html" });
+    const findings = result.findings.filter(
+      (f) => f.code === "root_composition_missing_duration_source",
+    );
+    expect(findings.length).toBe(1);
+    expect(findings[0]?.severity).toBe("error");
+  });
+
+  it("reports a split data-attribute selector that lives only in a script string literal", async () => {
+    const html = `
+<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    document.querySelector('[data-composition-id="main" data-start="0"]');
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html, { filePath: "compositions/main.html" });
+    const findings = result.findings.filter((f) => f.code === "split_data_attribute_selector");
+    expect(findings.length).toBe(1);
+    expect(findings[0]?.severity).toBe("error");
+  });
+
+  it("does not report a template-literal selector that only appears in a comment or a string", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    // Hardcoded on purpose — do NOT use document.querySelector(\`#\${id}\`) here.
+    const SAMPLE = 'document.querySelector(\`[data-composition-id="\${compId}"]\`)';
+    document.getElementById("snippet").textContent = SAMPLE;
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "template_literal_selector")).toBeUndefined();
+  });
+
+  it("reports a template-literal selector in code position and quotes the real source", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const compId = "main";
+    const el = document.querySelector(\`[data-composition-id="\${compId}"]\`);
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "template_literal_selector");
+    expect(finding?.severity).toBe("error");
+    expect(finding?.snippet).toContain("data-composition-id");
+  });
+
+  it("does not report a split data-attribute selector written inside a CSS comment", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <style>
+    /* never write [data-composition-id="main" data-start="0"] — split the brackets */
+    #root { background: #111; }
+  </style>
+  <script>
+    window.__timelines = window.__timelines || {};
+    // and not [data-composition-id="main" data-start="0"] in a JS comment either
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.filter((f) => f.code === "split_data_attribute_selector")).toHaveLength(
+      0,
+    );
+  });
+
   describe("timed_element_missing_clip_class", () => {
     it("flags element with data-start but no class='clip'", async () => {
       const html = `
@@ -282,7 +577,10 @@ describe("composition rules", () => {
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
       expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
+      // A warning, not an error: the runtime hides the element either way (see
+      // the message), so a missing marker class is an authoring-convention gap.
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).not.toContain("visible for the entire composition");
     });
 
     it("does not flag element that has class='clip'", async () => {
@@ -301,12 +599,16 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
-    it("does not flag audio or video elements", async () => {
+    it("does not flag the media primitives: audio, video, img", async () => {
+      // All three are authored without class="clip" in the canonical clip block
+      // (packages/core/docs/core.md). `img` used to be the only one of the three
+      // that errored, so the documented example failed its own linter.
       const html = `
 <html><body>
   <div data-composition-id="c1" data-width="1920" data-height="1080">
     <audio data-start="0" data-duration="5" src="music.mp3"></audio>
     <video data-start="0" data-duration="5" src="clip.mp4"></video>
+    <img data-start="5" data-duration="4" src="still.png" />
   </div>
   <script>
     window.__timelines = window.__timelines || {};
@@ -316,6 +618,27 @@ describe("composition rules", () => {
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
       expect(finding).toBeUndefined();
+    });
+
+    it("leaves the documented canonical clip block completely clean", async () => {
+      // Verbatim from packages/core/docs/core.md. If this ever goes red again,
+      // the docs and the linter have drifted apart and one of them is wrong.
+      const html = `
+<html><body>
+  <div id="comp-1" data-composition-id="my-video" data-width="1920" data-height="1080" data-start="0">
+    <video id="el-1" data-start="0" data-duration="10" data-track-index="0" src="a.mp4" muted></video>
+    <img id="el-3" data-start="5" data-duration="4" data-track-index="1" src="a.png" />
+    <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="a.mp3"></audio>
+  </div>
+  <script src="gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    window.__timelines["my-video"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const blocking = result.findings.filter((f) => f.severity !== "info");
+      expect(blocking.map((f) => `${f.severity}:${f.code}`)).toEqual([]);
     });
 
     it("does not flag element with only data-track-index (layer container, no timing)", async () => {
@@ -333,78 +656,6 @@ describe("composition rules", () => {
 </body></html>`;
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
-      expect(finding).toBeUndefined();
-    });
-  });
-
-  describe("overlapping_clips_same_track", () => {
-    it("flags overlapping clips on the same track", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="3" data-track-index="0">A</div>
-    <div class="clip" data-start="2" data-duration="3" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
-    });
-
-    it("does not flag clips on different tracks", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="3" data-track-index="0">A</div>
-    <div class="clip" data-start="1" data-duration="3" data-track-index="1">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeUndefined();
-    });
-
-    it("does not flag sequential clips on the same track", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="2" data-track-index="0">A</div>
-    <div class="clip" data-start="2" data-duration="2" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeUndefined();
-    });
-
-    it("does not flag adjacencies where parseFloat + add drifts by a few ulps", async () => {
-      // parseFloat("0.1") + parseFloat("0.2") = 0.30000000000000004
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0.1" data-duration="0.2" data-track-index="0">A</div>
-    <div class="clip" data-start="0.3" data-duration="0.2" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
       expect(finding).toBeUndefined();
     });
   });
@@ -605,6 +856,216 @@ describe("composition rules", () => {
       );
       expect(finding).toBeUndefined();
     });
+
+    it("does not flag a call the composition only renders as on-screen text", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const fn = "step";
+    document.getElementById("snippet").textContent = "requestAnimationFrame(step);";
+    document.getElementById("snippet").title = \`requestAnimationFrame(\${fn});\`;
+    window.__timelines["c1"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "requestanimationframe_in_composition"),
+      ).toBeUndefined();
+    });
+
+    it("still flags a call inside a template interpolation, which is code", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const label = \`frame \${requestAnimationFrame(() => {})}\`;
+    document.getElementById("snippet").textContent = label;
+    window.__timelines["c1"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "requestanimationframe_in_composition")?.severity,
+      ).toBe("error");
+    });
+  });
+
+  describe("missing_data_no_timeline", () => {
+    it("warns when root has no timeline registration and no data-no-timeline", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "missing_data_no_timeline");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("warning");
+    });
+
+    it("does not warn when data-no-timeline is present (boolean form)", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-no-timeline data-width="320" data-height="180" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it.each([
+      'window.__timelines["c1"] = gsap.timeline({ paused: true });',
+      "window.__timelines.c1 = gsap.timeline({ paused: true });",
+      "window.__timelines = { c1: gsap.timeline({ paused: true }) };",
+      'window.__timelines = { "c1": gsap.timeline({ paused: true }) };',
+      'const spec = { id: "c1" }; window.__timelines[spec.id] = gsap.timeline({ paused: true });',
+      'window.__timelines["c1"] ??= gsap.timeline({ paused: true });',
+      'window.__timelines["c1"] ||= gsap.timeline({ paused: true });',
+      'const ids = ["c1"]; window.__timelines[ids[0]] = gsap.timeline({ paused: true });',
+    ])("does not warn when a script registers a timeline: %s", async (registration) => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    ${registration}
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("warns for each bare nested composition id without a timeline or opt-out", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section id="alpha" data-composition-id="alpha"></section>
+    <section id="beta" data-composition-id="beta"></section>
+  </div>
+  <script>window.__timelines["root"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const findings = result.findings.filter((f) => f.code === "missing_data_no_timeline");
+
+      expect(findings).toHaveLength(2);
+      expect(findings.map((finding) => finding.elementId)).toEqual(["alpha", "beta"]);
+      expect(findings[0]?.message).toContain('Composition host "alpha"');
+      expect(findings[0]?.fixHint).toContain("plain `id`");
+    });
+
+    it("ignores a timeline registration that only appears in a script comment", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="static"></section>
+  </div>
+  <script>
+    window.__timelines["root"] = gsap.timeline({ paused: true });
+    // window.__timelines["static"] = timeline;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")?.message).toContain(
+        'Composition host "static"',
+      );
+    });
+
+    it("accepts nested hosts with registrations, sources, or explicit opt-outs", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="registered"></section>
+    <section data-composition-id="static" data-no-timeline></section>
+    <section data-composition-id="source" data-composition-src="source.html"></section>
+    <section data-composition-id="compiled" data-composition-file="compiled.html"></section>
+  </div>
+  <script>
+    window.__timelines.root = gsap.timeline({ paused: true });
+    window.__timelines.registered = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("does not guess which host a computed timeline key registers", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="scene"></section>
+  </div>
+  <script>
+    const compositionId = "scene";
+    window.__timelines[compositionId] = (gsap.timeline({ paused: true }));
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("checks bare nested hosts inside a sub-composition file", async () => {
+      const html = `<template>
+  <div data-composition-id="scene" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="static-part"></section>
+  </div>
+</template>`;
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")?.message).toContain(
+        'Composition host "static-part"',
+      );
+    });
+
+    it.each([
+      "window.__timelines = {};",
+      '// window.__timelines["c1"] = gsap.timeline({ paused: true });',
+    ])("still warns when a script does not register a timeline: %s", async (script) => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
+  <script>${script}</script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toMatchObject({
+        severity: "warning",
+      });
+    });
+
+    it("does not warn when there is no root composition-id", async () => {
+      const html = `<!DOCTYPE html><html><body><p>hello</p></body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("does not false-positive when data-no-timeline appears only inside an attribute value", async () => {
+      // Regression: /\bdata-no-timeline\b/ matched substrings inside values
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" title="add data-no-timeline here" data-width="320" data-height="180" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeDefined();
+    });
+
+    it("does not suppress when a hyphenated variant like data-no-timeline-start is present", async () => {
+      // Regression: /\bdata-no-timeline\b/ matched data-no-timeline-start because
+      // hyphen is a non-word char and \b fires between 'e' and '-'
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-no-timeline-start="0" data-width="320" data-height="180" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeDefined();
+    });
+
+    it("does not warn for sub-compositions", async () => {
+      const html = `<template><div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div></template>`;
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("does not warn when composition has external scripts (cannot scan for timeline registration)", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
+  <script src="app.js"></script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
   });
 
   describe("root_composition_missing_data_duration (removed)", () => {
@@ -680,6 +1141,37 @@ describe("composition rules", () => {
     });
   });
 
+  describe("unknown_variable_binding", () => {
+    it("warns when data-var-src references an undeclared variable", async () => {
+      const html = `<html data-composition-variables='[{"id":"hero","type":"image","label":"Hero","default":"a.jpg"}]'><body>
+<img id="i" data-start="0" data-duration="2" data-var-src="heroImge" src="a.jpg" />
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "unknown_variable_binding");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).toMatch(/heroImge/);
+    });
+
+    it("stays quiet for declared binding ids and for fragment files", async () => {
+      const declared = `<html data-composition-variables='[{"id":"title","type":"string","label":"T","default":"x"}]'><body>
+<h1 data-var-text="title">x</h1>
+</body></html>`;
+      expect(
+        (await lintHyperframeHtml(declared)).findings.some(
+          (f) => f.code === "unknown_variable_binding",
+        ),
+      ).toBe(false);
+
+      const fragment = `<div class="clip" data-start="0" data-duration="2" data-var-text="hostProvided">x</div>`;
+      expect(
+        (await lintHyperframeHtml(fragment)).findings.some(
+          (f) => f.code === "unknown_variable_binding",
+        ),
+      ).toBe(false);
+    });
+  });
+
   describe("invalid_variable_values_json", () => {
     it("warns when data-variable-values is unparseable JSON", async () => {
       const html = `<html><body>
@@ -730,6 +1222,15 @@ describe("composition rules", () => {
   });
 
   describe("invalid_composition_variables_declaration", () => {
+    it("checks a declaration on the composition root too", async () => {
+      const html = `<html><body><div data-composition-id="x" data-composition-variables='[{"id":12345}]'></div></body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find(
+        (f) => f.code === "invalid_composition_variables_declaration",
+      );
+      expect(finding).toBeDefined();
+    });
+
     it("warns when data-composition-variables is unparseable JSON", async () => {
       const html = `<html data-composition-variables='[{not json'><body><div data-composition-id="x"></div></body></html>`;
       const result = await lintHyperframeHtml(html);
@@ -783,6 +1284,24 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
+    it("does not warn for an HTML-entity-encoded declarations array", async () => {
+      const declarations = JSON.stringify([
+        {
+          id: "title",
+          type: "string",
+          label: "Title",
+          description: 'A "quoted" title',
+          default: "Hello",
+        },
+      ]).replaceAll('"', "&quot;");
+      const html = `<html data-composition-variables='${declarations}'><body><div data-composition-id="x"></div></body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find(
+        (f) => f.code === "invalid_composition_variables_declaration",
+      );
+      expect(finding).toBeUndefined();
+    });
+
     it("does not warn when data-composition-variables is absent", async () => {
       const html = `<html><body><div data-composition-id="x"></div></body></html>`;
       const result = await lintHyperframeHtml(html);
@@ -793,68 +1312,143 @@ describe("composition rules", () => {
     });
   });
 
+  describe("unloadable_media_variable_default", () => {
+    const CODE = "unloadable_media_variable_default";
+    const find = (r: { findings: { code: string }[] }) => r.findings.find((f) => f.code === CODE);
+
+    it("errors on an image variable defaulting to a file:// URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"bg","type":"image","label":"BG","default":"file:///abs/assets/blue.png"}]'><body><img data-composition-id="x" src="assets/red.png" data-var-src="bg"></body></html>`;
+      const finding = find(await lintHyperframeHtml(html));
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/authored fallback/);
+    });
+
+    it("errors on a non-image variable that a data-var-src binding consumes as a URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"clip","type":"string","label":"Clip","default":"file:///abs/a.mp4"}]'><body><video data-composition-id="x" src="a.mp4" data-var-src="clip"></video></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeDefined();
+    });
+
+    it("stays quiet for relative, http(s) and data:image defaults", async () => {
+      const html = `<html data-composition-variables='[
+        {"id":"a","type":"image","label":"A","default":"assets/blue.png"},
+        {"id":"b","type":"image","label":"B","default":"https://example.com/b.png"},
+        {"id":"c","type":"image","label":"C","default":"data:image/png;base64,iVBORw0KGgo="}
+      ]'><body><img data-composition-id="x" src="r.png" data-var-src="a"></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeUndefined();
+    });
+
+    it("does not treat an unbound scalar variable as a URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"note","type":"string","label":"Note","default":"mailto:hi@example.com"}]'><body><div data-composition-id="x"></div></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeUndefined();
+    });
+  });
+
   describe("invalid_parent_traversal_in_asset_path", () => {
     const RULE_CODE = "invalid_parent_traversal_in_asset_path";
 
-    it("errors when an <img> src uses ../capture/", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <img src="../capture/assets/logo.svg" alt="logo">
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    const lintAt = (compSrcPath: string, body: string) =>
+      lintHyperframeHtml(`<html><body><div data-composition-id="x">${body}</div></body></html>`, {
+        compSrcPath,
+      }).then((result) => result.findings.find((f) => f.code === RULE_CODE));
+
+    it("errors when the root file's <img> src climbs out of the project with ../capture/", async () => {
+      const finding = await lintAt("index.html", `<img src="../capture/assets/logo.svg" alt="">`);
       expect(finding?.severity).toBe("error");
       expect(finding?.message).toContain("../capture/");
     });
 
-    it("errors when a <video> src uses ../assets/ (HF#1698 shape)", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <video src="../assets/clip.mp4" muted></video>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
-      expect(finding?.message).toContain("../assets/");
+    it("accepts ../assets/ from compositions/scene.html: it resolves to the project's assets/", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<video src="../assets/clip.mp4" muted></video>`),
+      ).toBeUndefined();
     });
 
-    it("errors when a <video> src uses ../../assets/ from a nested compositions/frames/ file", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <video src="../../assets/clip.mp4" muted></video>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/frames/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    it("errors when ../../assets/ from compositions/scene.html climbs out of the project", async () => {
+      const finding = await lintAt(
+        "compositions/scene.html",
+        `<video src="../../assets/clip.mp4" muted></video>`,
+      );
       expect(finding?.message).toContain("../../assets/");
     });
 
-    it("errors when a <link> href uses ../fonts/", async () => {
+    it("resolves from a nested compositions/frames/ file's own folder", async () => {
+      const nested = "compositions/frames/scene.html";
+      expect(
+        await lintAt(nested, `<video src="../../assets/clip.mp4" muted></video>`),
+      ).toBeUndefined();
+      expect(await lintAt(nested, `<img src="../../../x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors on an encoded or backslashed climb out of the project", async () => {
+      const scene = "compositions/scene.html";
+      expect(await lintAt(scene, `<img src="../%2E%2e/x.png" alt="">`)).toBeDefined();
+      expect(await lintAt(scene, `<img src="../..\\x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors on a climb from the root file however its first segment is written", async () => {
+      for (const src of ["%2e%2e/x.png", "..\\x.png", "assets/../../x.png", "&#46;&#46;/x.png"]) {
+        expect(await lintAt("index.html", `<img src="${src}" alt="">`)).toBeDefined();
+      }
+    });
+
+    it("counts an absolute or ..-containing file path's folder as the project root", async () => {
+      for (const file of [
+        "/srv/project/index.html",
+        "C:\\project\\index.html",
+        "sub/../index.html",
+      ]) {
+        expect(await lintAt(file, `<img src="../x.png" alt="">`)).toBeDefined();
+      }
+    });
+
+    it("reads an encoded %2f as a separator, as render decodes it", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<img src="..%2f..%2fx.png" alt="">`),
+      ).toBeDefined();
+    });
+
+    it("never counts a file path's leading .. below the project root", async () => {
+      expect(await lintAt("../x/scene.html", `<img src="../y.png" alt="">`)).toBeUndefined();
+    });
+
+    it("ignores URLs with a scheme, absolute paths and fragments", async () => {
+      for (const src of ["https://cdn.example.com/../../x.png", "/../x.png", "#../x"]) {
+        expect(await lintAt("index.html", `<img src="${src}" alt="">`)).toBeUndefined();
+      }
+    });
+
+    it("ignores a path's query and hash", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<img src="../assets/x.png#/../../../../" alt="">`),
+      ).toBeUndefined();
+    });
+
+    it("treats a file linted without compSrcPath as the project root", async () => {
+      const { findings } = await lintHyperframeHtml(
+        `<html><body><div data-composition-id="x"><img src="../x.png" alt=""></div></body></html>`,
+      );
+      expect(findings.map((f) => f.code)).toContain(RULE_CODE);
+    });
+
+    it("errors when a path dips out of the project midway or the file path starts with ./", async () => {
+      const scene = "compositions/scene.html";
+      expect(await lintAt(scene, `<img src="../assets/../../x.png" alt="">`)).toBeDefined();
+      expect(await lintAt(`./${scene}`, `<img src="../../x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors when a <link> href climbs out of the project with ../fonts/", async () => {
       const html = `<html><head>
         <link rel="stylesheet" href="../fonts/brand.css">
       </head><body>
         <div data-composition-id="x"></div>
       </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
+      const result = await lintHyperframeHtml(html, { compSrcPath: "index.html" });
       const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
       expect(finding?.message).toContain("../fonts/");
     });
 
-    it("errors when a CSS url() uses ../assets/ in a <style> block (counts all occurrences)", async () => {
+    it("errors when CSS url()s in a <style> block climb out of the project (counts all occurrences)", async () => {
       const html = `<html><body>
         <style>
           @font-face { font-family: 'Brand'; src: url('../fonts/Brand.woff2'); }
@@ -862,25 +1456,16 @@ describe("composition rules", () => {
         </style>
         <div data-composition-id="x"></div>
       </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
+      const result = await lintHyperframeHtml(html, { compSrcPath: "index.html" });
       const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
       expect(finding?.message).toContain("2 asset path(s)");
     });
 
-    it("errors when an inline style url() uses ../assets/", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <div style="background-image: url('../assets/hero.png');"></div>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    it("errors when an inline style url() climbs out of the project", async () => {
+      const finding = await lintAt(
+        "index.html",
+        `<div style="background-image: url('../assets/hero.png');"></div>`,
+      );
       expect(finding?.message).toContain("../assets/");
     });
 
@@ -1009,6 +1594,70 @@ describe("composition rules", () => {
     });
   });
 
+  describe("html_dir_attribute_breaks_render", () => {
+    const CODE = "html_dir_attribute_breaks_render";
+    const find = (findings: { code: string }[]) => findings.find((f) => f.code === CODE);
+
+    it('flags dir="rtl" on <html>', async () => {
+      const html = `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5">مرحبا</div>
+</body>
+</html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = find(result.findings);
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain('dir="rtl"');
+      expect(finding?.fixHint).toContain("direction: rtl");
+    });
+
+    it('flags dir="auto" on <html>', async () => {
+      const html = `<html dir="AUTO"><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = find(result.findings);
+      expect(finding).toBeDefined();
+      expect(finding?.fixHint).toContain('dir="auto"');
+    });
+
+    it('does not flag dir="ltr"', async () => {
+      const html = `<html dir="ltr"><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+    });
+
+    it("does not flag invalid dir values that browsers treat as ltr", async () => {
+      const html = `<html dir="bogus"><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+    });
+
+    it("does not flag when <html> has no dir attribute", async () => {
+      const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5"></div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+    });
+
+    it('does not flag dir="rtl" scoped to an individual element (the documented fix)', async () => {
+      const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="5">
+    <p style="direction: rtl;">مرحبا</p>
+  </div>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+    });
+  });
+
   describe("subcomposition_blanks_before_host", () => {
     const find = (findings: Array<{ code: string }>) =>
       findings.find((f) => f.code === "subcomposition_blanks_before_host");
@@ -1134,6 +1783,55 @@ describe("composition rules", () => {
       const finding = find(result.findings);
       expect(finding).toBeDefined();
       expect(finding?.severity).toBe("error");
+    });
+
+    it("warns, and says where to author the length, when timed clips give the root a length", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <img src="a.png" data-start="2" />
+          <div class="clip" data-start="0" data-duration="6"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+      const derived = result.findings.find((f) => f.code === "root_composition_duration_derived");
+      expect(derived?.severity).toBe("warning");
+      expect(derived?.message).toContain("at least 6s");
+      expect(derived?.fixHint).toContain("data-duration");
+    });
+
+    it("counts a clip with a reference start or a video with no length as known only at runtime", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <img src="a.png" data-start="0" />
+          <video src="v.mp4" data-start="0"></video>
+          <div class="clip" data-start="a+1" data-duration="2"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const derived = result.findings.find((f) => f.code === "root_composition_duration_derived");
+      expect(derived?.message).toContain("at least 3s");
+      expect(derived?.message).toContain("2 clip(s) whose length is only known at runtime");
+    });
+
+    it("does not count a clip whose data-end is before its start", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <div class="clip" data-start="5" data-end="3"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)?.severity).toBe("error");
+    });
+
+    it("still errors when the only clips have no length to derive from", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <div class="clip" data-start="0"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)?.severity).toBe("error");
     });
 
     it("does not error when data-duration is declared on the root", async () => {
@@ -1419,6 +2117,559 @@ describe("composition rules", () => {
       </body></html>`;
       const result = await lintHyperframeHtml(html);
       expect(find(result.findings)).toBeUndefined();
+    });
+  });
+
+  // composition_heavy_overlay_count_high — field signal ts=1784040753.
+  // See rule comments in ../rules/composition.ts for the black-frame repro
+  // story. Threshold: WARN at 25+ elements with filter:blur / clip-path
+  // (non-none) / radial-gradient. Presence-based: opacity:0 and
+  // visibility:hidden are counted-in, display:none is counted-out.
+  describe("composition_heavy_overlay_count_high", () => {
+    const wrap = (bodyInner: string, headInner = ""): string =>
+      `<!DOCTYPE html><html><head>${headInner}</head><body>
+        <div data-composition-id="main" data-start="0" data-duration="10" data-width="1920" data-height="1080">
+          ${bodyInner}
+        </div>
+      </body></html>`;
+
+    const repeat = (n: number, template: (i: number) => string): string =>
+      Array.from({ length: n }, (_, i) => template(i)).join("\n");
+
+    it("warns when a composition has 40 blur-filtered overlays", async () => {
+      const overlays = repeat(
+        40,
+        (i) => `<div id="ov-${i}" style="filter: blur(6px); opacity: 0.6"></div>`,
+      );
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).toMatch(/40 elements/);
+      expect(finding?.message).toMatch(/filter:blur/);
+      expect(finding?.fixHint).toMatch(/ts=1784040753/);
+    });
+
+    it("warns when 30 elements share a clip-path class defined in a <style> block", async () => {
+      const head = `<style>.clipped { clip-path: circle(50%); }</style>`;
+      const overlays = repeat(30, (i) => `<div id="c-${i}" class="clipped"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays, head));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.message).toMatch(/30 elements/);
+    });
+
+    it("warns when 25 mixed heavy overlays are present (blur + clip-path + radial-gradient)", async () => {
+      const head = `<style>.clipped { clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%); }</style>`;
+      const blur = repeat(9, (i) => `<div id="b-${i}" style="filter: blur(4px)"></div>`);
+      const clip = repeat(8, (i) => `<div id="c-${i}" class="clipped"></div>`);
+      const radial = repeat(
+        8,
+        (i) => `<div id="r-${i}" style="background: radial-gradient(circle, red, blue)"></div>`,
+      );
+      const result = await lintHyperframeHtml(wrap(blur + clip + radial, head));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.message).toMatch(/25 elements/);
+    });
+
+    it("does not warn when only 5 blur overlays are present (well below threshold)", async () => {
+      const overlays = repeat(5, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not warn on 40 plain non-overlay divs (no heavy CSS anywhere)", async () => {
+      const overlays = repeat(40, (i) => `<div id="p-${i}">plain ${i}</div>`);
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("counts opacity:0 blur overlays IN (presence alone matters per field signal)", async () => {
+      const overlays = repeat(
+        30,
+        (i) => `<div id="hidden-${i}" style="filter: blur(6px); opacity: 0"></div>`,
+      );
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.message).toMatch(/30 elements/);
+    });
+
+    it("counts visibility:hidden blur overlays IN (presence alone matters)", async () => {
+      const overlays = repeat(
+        30,
+        (i) => `<div id="hidden-${i}" style="filter: blur(6px); visibility: hidden"></div>`,
+      );
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+    });
+
+    it("counts display:none blur overlays OUT (element removed from render tree)", async () => {
+      const overlays = repeat(
+        40,
+        (i) => `<div id="gone-${i}" style="filter: blur(6px); display: none"></div>`,
+      );
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not warn on registry source files (block library authoring surface)", async () => {
+      const overlays = repeat(40, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays), {
+        filePath: "/project/registry/blocks/blur-hero/blur-hero.html",
+      });
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not warn on registry-installed block files (`hyperframes-registry-item` marker)", async () => {
+      const overlays = repeat(40, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const html =
+        "<!-- hyperframes-registry-item: blur-hero -->\n" +
+        `<!DOCTYPE html><html><body>
+          <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+            ${overlays}
+          </div>
+        </body></html>`;
+      const result = await lintHyperframeHtml(html, {
+        filePath: "/project/compositions/blur-hero.html",
+      });
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("does not warn when 24 heavy overlays are present (just below threshold)", async () => {
+      const overlays = repeat(24, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("ignores `clip-path: none` (does not count as a heavy overlay)", async () => {
+      const overlays = repeat(40, (i) => `<div id="none-${i}" style="clip-path: none"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeUndefined();
+    });
+
+    it("matches heavy selectors by leftmost id (e.g. `#hero { clip-path: ... }`)", async () => {
+      const head = `<style>#hero-${0} { clip-path: circle(30%); }</style>`;
+      // Single id selector wouldn't match 30 elements meaningfully, so use a
+      // class-based repro plus one id-hit to prove the id lookup runs.
+      const clipHead = `<style>.clipped { clip-path: circle(50%); }</style>${head}`;
+      const clipped = repeat(29, (i) => `<div id="c-${i}" class="clipped"></div>`);
+      const idHit = `<div id="hero-0"></div>`;
+      const result = await lintHyperframeHtml(wrap(clipped + idHit, clipHead));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.message).toMatch(/30 elements/);
+    });
+
+    it("uses sub-composition-flavored fix hint when isSubComposition is set", async () => {
+      const overlays = repeat(30, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const result = await lintHyperframeHtml(wrap(overlays), {
+        isSubComposition: true,
+      });
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.fixHint).toMatch(/sub-composition further/);
+    });
+
+    it("does not double-count the composition root itself (only overlay children)", async () => {
+      // 25 blur overlays live inside a root that itself has `filter: blur(...)`.
+      // If we counted the root too, the count would be 26 (still fires); the
+      // message must report 25 to prove the root skip is working.
+      const overlays = repeat(25, (i) => `<div id="ov-${i}" style="filter: blur(6px)"></div>`);
+      const html = `<!DOCTYPE html><html><body>
+        <div data-composition-id="main" data-start="0" data-duration="10" data-width="1920" data-height="1080" style="filter: blur(8px)">
+          ${overlays}
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find(
+        (f) => f.code === "composition_heavy_overlay_count_high",
+      );
+      expect(finding).toBeDefined();
+      expect(finding?.message).toMatch(/25 elements/);
+    });
+  });
+
+  // root_zoom_rescales_a_fixed_canvas — measured at 0.8.71 on an 800x400
+  // composition: root zoom:2 renders a left:600 box at ZERO pixels (scaled to
+  // x=1200, outside a frame still 800 wide); root zoom:0.5 paints the whole
+  // composition into the top-left quarter. A zoom on a DESCENDANT is honoured
+  // exactly as CSS specifies and must stay silent.
+  describe("root_zoom_rescales_a_fixed_canvas", () => {
+    const codes = (r: { findings: Array<{ code: string }> }) => r.findings.map((f) => f.code);
+
+    it("flags a rescaling zoom on the composition root", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { width: 800px; height: 400px; zoom: 2; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+
+      expect(codes(result)).toContain("root_zoom_rescales_a_fixed_canvas");
+      const finding = result.findings.find((f) => f.code === "root_zoom_rescales_a_fixed_canvas");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain("zero pixels");
+    });
+
+    it("describes the shrinking case as dead space, not clipping", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { zoom: 0.5; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+
+      const finding = result.findings.find((f) => f.code === "root_zoom_rescales_a_fixed_canvas");
+      expect(finding?.message).toContain("dead space");
+      expect(finding?.message).not.toContain("zero pixels");
+    });
+
+    it("flags zoom on html and on body, which scale the canvas from above", async () => {
+      for (const selector of ["html", "body"]) {
+        const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+          ${selector} { zoom: 1.5; }
+        </style></head><body>
+          <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+        </body></html>`);
+        expect(codes(result)).toContain("root_zoom_rescales_a_fixed_canvas");
+      }
+    });
+
+    it("flags an inline zoom on the root", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div id="root" style="zoom: 2" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+
+      expect(codes(result)).toContain("root_zoom_rescales_a_fixed_canvas");
+    });
+
+    it("stays silent on a zoom applied to a descendant", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        .badge { zoom: 2; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5">
+          <div class="badge"></div>
+        </div>
+      </body></html>`);
+
+      expect(codes(result)).not.toContain("root_zoom_rescales_a_fixed_canvas");
+    });
+
+    it("stays silent on identity zoom values", async () => {
+      for (const value of ["1", "1.0", "100%", "normal", "unset", "initial"]) {
+        const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+          #root { zoom: ${value}; }
+        </style></head><body>
+          <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+        </body></html>`);
+        expect(codes(result)).not.toContain("root_zoom_rescales_a_fixed_canvas");
+      }
+    });
+
+    // A custom property is not the CSS `zoom` property. A plain \b boundary
+    // flags both, which is the same trap the negative-z-index rule hit.
+    it("stays silent on custom properties whose name ends in zoom", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { --zoom: 2; --panel-zoom: 0.5; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+
+      expect(codes(result)).not.toContain("root_zoom_rescales_a_fixed_canvas");
+    });
+
+    it("reads through !important", async () => {
+      const identity = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { zoom: 1 !important; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+      expect(codes(identity)).not.toContain("root_zoom_rescales_a_fixed_canvas");
+
+      const rescaling = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { zoom: 2 !important; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+      const finding = rescaling.findings.find(
+        (f) => f.code === "root_zoom_rescales_a_fixed_canvas",
+      );
+      expect(finding?.message).toContain("zoom: 2`");
+    });
+
+    it("ignores a zoom inside a CSS comment", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><head><style>
+        #root { /* zoom: 2; */ width: 800px; }
+      </style></head><body>
+        <div id="root" data-composition-id="main" data-width="800" data-height="400" data-duration="5"></div>
+      </body></html>`);
+
+      expect(codes(result)).not.toContain("root_zoom_rescales_a_fixed_canvas");
+    });
+  });
+
+  // composition_exceeds_inspection_viewport_cap — measured at 0.8.71: a
+  // 5000x400 composition renders 5000x400 with all content, while snapshot
+  // (and check/validate/compare/layout, which share the same capture helper)
+  // returns 4096x400 with the element at left:4500 absent.
+  describe("composition_exceeds_inspection_viewport_cap", () => {
+    const codes = (r: { findings: Array<{ code: string }> }) => r.findings.map((f) => f.code);
+    const root = (attrs: string) =>
+      `<!doctype html><html><body><div id="root" data-composition-id="main" ${attrs} data-duration="5"></div></body></html>`;
+
+    it("warns when data-width exceeds the cap", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="5000" data-height="400"`));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_exceeds_inspection_viewport_cap",
+      );
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).toContain("data-width=5000");
+      expect(finding?.message).not.toContain("data-height");
+    });
+
+    it("warns when data-height exceeds the cap", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="1080" data-height="4500"`));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_exceeds_inspection_viewport_cap",
+      );
+      expect(finding?.message).toContain("data-height=4500");
+    });
+
+    it("names both axes when both exceed the cap", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="5000" data-height="4500"`));
+      const finding = result.findings.find(
+        (f) => f.code === "composition_exceeds_inspection_viewport_cap",
+      );
+      expect(finding?.message).toContain("data-width=5000 and data-height=4500");
+    });
+
+    it("is silent exactly at the cap", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="4096" data-height="4096"`));
+      expect(codes(result)).not.toContain("composition_exceeds_inspection_viewport_cap");
+    });
+
+    it("fires one past the cap", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="4097" data-height="1080"`));
+      expect(codes(result)).toContain("composition_exceeds_inspection_viewport_cap");
+    });
+
+    it("is silent on ordinary dimensions", async () => {
+      const result = await lintHyperframeHtml(root(`data-width="3840" data-height="2160"`));
+      expect(codes(result)).not.toContain("composition_exceeds_inspection_viewport_cap");
+    });
+
+    it("is silent when the dimensions are absent or unparseable", async () => {
+      for (const attrs of [``, `data-width="wide" data-height="tall"`]) {
+        const result = await lintHyperframeHtml(root(attrs));
+        expect(codes(result)).not.toContain("composition_exceeds_inspection_viewport_cap");
+      }
+    });
+  });
+
+  describe("negative z-index", () => {
+    const wrap = (
+      head: string,
+      body: string,
+    ) => `<!doctype html><html><head><style>${head}</style></head><body>
+  <div id="root" data-composition-id="main" data-no-timeline data-width="640" data-height="360" data-start="0" data-duration="1">
+${body}
+  </div>
+</body></html>`;
+
+    it("flags a negative z-index in a style block and names the selector", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "#under { position:absolute; z-index: -1; }",
+          `    <div id="under" class="clip" data-start="0" data-duration="1"></div>`,
+        ),
+      );
+      const finding = result.findings.find((f) => f.code === "negative_z_index");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.selector).toBe("#under");
+      expect(finding?.message).toContain("z-index: -1");
+    });
+
+    // Reviewed nit, confirmed on rendered pixels at 0.8.72: the element is only
+    // dropped when its nearest ancestor stacking context is the composition root.
+    // One frame carried the same `z-index: -1` band under isolation:isolate,
+    // transform, opacity<1, filter, contain:paint and will-change -- all six
+    // PRESENT at full coverage, the no-stacking-context control ABSENT at zero.
+    // This rule matches CSS text and cannot resolve the cascade, so it fires on
+    // both shapes; the message must therefore stay conditional.
+    it("states the stacking-context CONDITION rather than asserting absence", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "#under { position:absolute; z-index: -1; }",
+          `    <div id="under" class="clip" data-start="0" data-duration="1"></div>`,
+        ),
+      );
+      const finding = result.findings.find((f) => f.code === "negative_z_index");
+      expect(finding?.message).toContain("behind its nearest stacking context");
+      // Reviewer's edge case: with a TRANSPARENT composition root the element is
+      // VISIBLE (measured), so the hiding must be stated as CONDITIONAL on an opaque
+      // background, never asserted outright.
+      expect(finding?.message).toContain("an opaque background there hides it");
+      expect(finding?.message).toContain("A transparent root leaves it visible");
+      expect(finding?.message).not.toContain("renders invisibly unless");
+      // The cause is painting order, not a tool failure. Both phrasings below imply
+      // the renderer dropped the element, which the pixels refute.
+      expect(finding?.message).not.toContain("is silently dropped");
+      expect(finding?.message).not.toContain("zero exit code");
+    });
+
+    it("offers a stacking context as the measured remedy, not only DOM reordering", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "#under { position:absolute; z-index: -1; }",
+          `    <div id="under" class="clip" data-start="0" data-duration="1"></div>`,
+        ),
+      );
+      const finding = result.findings.find((f) => f.code === "negative_z_index");
+      expect(finding?.fixHint).toContain("isolation: isolate");
+      expect(finding?.fixHint).toContain("DOM order");
+    });
+
+    it("flags a negative z-index in an inline style attribute", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "",
+          `    <div id="under" class="clip" style="position:absolute;z-index:-2" data-start="0" data-duration="1"></div>`,
+        ),
+      );
+      const finding = result.findings.find((f) => f.code === "negative_z_index");
+      expect(finding).toBeDefined();
+      expect(finding?.selector).toBe("#under");
+    });
+
+    it("does not flag zero or positive z-index", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "#a { z-index: 0; } #b { z-index: 1; } #c { z-index: 999; }",
+          `    <div id="a"></div>`,
+        ),
+      );
+      expect(result.findings.some((f) => f.code === "negative_z_index")).toBe(false);
+    });
+
+    it("does not flag a custom property whose name ends in z-index", async () => {
+      // Regression: /\bz-index\b/ treats the hyphen as a word break, so a plain
+      // boundary matches `--panel-z-index: -1`, which declares a variable and
+      // stacks nothing.
+      const result = await lintHyperframeHtml(
+        wrap("#a { --z-index: -1; --panel-z-index: -3; }", `    <div id="a"></div>`),
+      );
+      expect(result.findings.some((f) => f.code === "negative_z_index")).toBe(false);
+    });
+
+    it("does not flag a negative z-index inside a CSS comment", async () => {
+      const result = await lintHyperframeHtml(
+        wrap(
+          "#a { /* z-index: -1; was dropped by the renderer */ z-index: 2; }",
+          `    <div id="a"></div>`,
+        ),
+      );
+      expect(result.findings.some((f) => f.code === "negative_z_index")).toBe(false);
+    });
+
+    it("does not flag -0, which is not a negative stacking level", async () => {
+      const result = await lintHyperframeHtml(
+        wrap("#a { z-index: -0; }", `    <div id="a"></div>`),
+      );
+      expect(result.findings.some((f) => f.code === "negative_z_index")).toBe(false);
+    });
+
+    it("flags every negative declaration, not just the first", async () => {
+      const result = await lintHyperframeHtml(
+        wrap("#a { z-index: -1; } #b { z-index: -2; }", `    <div id="a"></div>`),
+      );
+      expect(result.findings.filter((f) => f.code === "negative_z_index")).toHaveLength(2);
+    });
+  });
+
+  describe("subcomposition_root_styled_by_class", () => {
+    it("flags when the root class is used as a CSS selector in a sub-composition", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          .my-root { background: red; }
+        </style>
+        <div data-composition-id="main" class="my-root" data-start="0" data-duration="5"></div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+      expect(result.findings).toContainEqual(
+        expect.objectContaining({
+          code: "subcomposition_root_styled_by_class",
+          severity: "error",
+        }),
+      );
+    });
+
+    it("passes when styling via #root and descendant selectors", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          #root { background: red; }
+          .child { color: blue; }
+        </style>
+        <div data-composition-id="main" id="root" class="my-root" data-start="0" data-duration="5">
+          <div class="child"></div>
+        </div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+      expect(result.findings.some((f) => f.code === "subcomposition_root_styled_by_class")).toBe(
+        false,
+      );
+    });
+
+    it("passes if it is not a sub-composition", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          .my-root { background: red; }
+        </style>
+        <div data-composition-id="main" class="my-root" data-start="0" data-duration="5"></div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: false });
+      expect(result.findings.some((f) => f.code === "subcomposition_root_styled_by_class")).toBe(
+        false,
+      );
     });
   });
 });

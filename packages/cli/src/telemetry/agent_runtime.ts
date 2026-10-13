@@ -22,6 +22,7 @@ import { detectWSL } from "./platform.js";
 export type SandboxRuntime = "gvisor" | "firecracker" | "docker" | "kvm" | "wsl" | null;
 
 export type AgentRuntime =
+  | "bob"
   | "claude_code"
   | "codex"
   | "cursor"
@@ -47,6 +48,18 @@ interface VendorRule {
 // before more generic ones (e.g. copilot_agent before a hypothetical generic
 // 'github_actions' rule).
 const VENDOR_RULES: VendorRule[] = [
+  // IBM Bob Shell — both shell execution paths stamp BOBSHELL_CLI=1 onto the
+  // child environment: childProcessFallback's spawn env and executeWithPty's
+  // PTY env. Keep this ahead of other agents because Bob inherits the parent
+  // environment, so a Bob session launched from Codex or Claude can carry both
+  // vendors' markers; BOBSHELL_CLI identifies the immediate executor.
+  // BOBSHELL_API_KEY is deliberately ignored: it is an authentication setting,
+  // not proof that Bob launched the current process.
+  // Source: IBM Bob Shell 1.0.6 bundle (lb.childProcessFallback / executeWithPty).
+  {
+    name: "bob",
+    check: (env) => typeof env["BOBSHELL_CLI"] === "string",
+  },
   // Anthropic Claude Code — sets CLAUDECODE=1 on every Bash/PowerShell tool
   // spawn (Shell.ts:321) and CLAUDE_CODE_ENTRYPOINT at startup, inherited by
   // every child (main.tsx:527). Both propagate to spawned subprocesses.
@@ -74,12 +87,12 @@ const VENDOR_RULES: VendorRule[] = [
       typeof env["CODEX_CI"] === "string" ||
       typeof env["CODEX_SANDBOX_NETWORK_DISABLED"] === "string",
   },
-  // Cursor IDE integrated terminal — exports TERM_PROGRAM=cursor (exact,
-  // lowercase). Cursor Background Agent env vars are not publicly documented;
-  // if a canonical marker is identified later, add it here.
+  // Cursor Agent marks its shell with CURSOR_AGENT; TERM_PROGRAM identifies
+  // the IDE terminal only. Keep this after Claude/Codex for nested agents.
+  // Source: https://docs.cursor.com/en/agent/terminal
   {
     name: "cursor",
-    check: (env) => env["TERM_PROGRAM"] === "cursor",
+    check: (env) => Boolean(env["CURSOR_AGENT"]) || env["TERM_PROGRAM"] === "cursor",
   },
   // Windsurf (Codeium) integrated terminal — exports TERM_PROGRAM=windsurf.
   // Attested across many independent detectors (nx
@@ -242,6 +255,150 @@ export function detectAgentRuntime(): AgentRuntime {
     if (rule.check(process.env)) return rule.name;
   }
   return null;
+}
+
+/** Observed harness marker, not proof of a vendor, benchmark, or human user. */
+export function detectExecutionHarnessHint(): "harbor" | null {
+  // Read presence only. Preserve this context even when the child agent is known.
+  return typeof process.env["HARBOR_AGENT"] === "string" ? "harbor" : null;
+}
+
+// ---------------------------------------------------------------------------
+// New-agent discovery signals.
+//
+// VENDOR_RULES is a CLOSED allowlist: an agent we haven't written a rule for
+// collapses to agent_runtime=null, leaving no trace of what it was. That makes
+// the null bucket un-attributable — new agents stay invisible until someone
+// reverse-engineers their marker by hand (which is how every rule above was
+// derived).
+//
+// detectAgentHints() adds a self-populating residual signal for exactly that
+// null bucket, so an unrecognized agent surfaces on its own in analytics and
+// can be promoted to a real VENDOR_RULE later. Callers should only emit these
+// when detectAgentRuntime() returns null — a classified event needs no hint.
+//
+// Privacy — consistent with the "never read secret-shaped values" stance above:
+//   - agent_env_hints emits KEY NAMES only, never values.
+//   - agent_hint / term_program read the VALUE of three vars whose sole purpose
+//     is non-secret self-identification: the emerging AGENT / AI_AGENT
+//     agent-name convention (e.g. Crush and Goose set AGENT=<name>) and
+//     TERM_PROGRAM's editor name (how the cursor/windsurf rules already work).
+//     Each value is passed through a strict short-slug allowlist, so anything
+//     long, spaced, or secret-shaped is dropped to null.
+// ---------------------------------------------------------------------------
+
+export interface AgentHints {
+  /**
+   * Best-effort agent name from a self-identifying env-var value: AGENT, else
+   * AI_AGENT. null when neither is set or the value isn't a short safe slug.
+   */
+  agent_hint: string | null;
+  /**
+   * Raw TERM_PROGRAM value (editor/terminal name) — surfaces IDE-terminal
+   * agents not yet covered by the cursor/windsurf rules. Noisy (also set by
+   * plain human terminals); read alongside is_tty=false. null when unset/unsafe.
+   */
+  term_program: string | null;
+  /**
+   * Sorted, comma-joined list of "agent-ish" env-var KEY names present but
+   * matched by no vendor rule — a compact fingerprint that clusters by agent.
+   * KEYS only, never values. null when none are present.
+   */
+  agent_env_hints: string | null;
+}
+
+// Self-identifying values are agent/editor NAMES by convention — short slugs.
+// Anything longer, spaced, or secret-shaped falls outside this and is dropped.
+const SAFE_HINT = /^[a-z0-9_.-]{1,32}$/;
+
+// The slug allowlist alone still accepts SHORT credential-shaped values
+// (AGENT=sk-ant-api03, AGENT=AKIAIOSFODNN7EXAMPLE, AGENT=github_pat_abc), so
+// two extra guards enforce the "never emit a secret" boundary this PR relies on:
+//   1. known credential/token prefixes (compared lowercased), and
+//   2. any unbroken alphanumeric run >= 16 chars — the shape of key bodies,
+//      hex digests, and base64-ish tokens (agent names segment on _/-/. and
+//      keep each run short).
+const CREDENTIAL_PREFIXES = [
+  "sk-",
+  "sk_",
+  "pk-",
+  "pplx-",
+  "ghp_",
+  "gho_",
+  "ghu_",
+  "ghs_",
+  "ghr_",
+  "github_pat_",
+  "glpat-",
+  "gsk_",
+  "xox",
+  "akia",
+  "asia",
+  "aiza",
+  "ya29",
+  "hf_",
+  "r8_",
+];
+const LONG_ALNUM_RUN = /[a-z0-9]{16,}/;
+
+function looksLikeCredential(v: string): boolean {
+  if (CREDENTIAL_PREFIXES.some((p) => v.startsWith(p))) return true;
+  return LONG_ALNUM_RUN.test(v);
+}
+
+function sanitizeHint(value: string | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const v = value.trim().toLowerCase();
+  if (!SAFE_HINT.test(v)) return null;
+  if (looksLikeCredential(v)) return null;
+  return v;
+}
+
+// A key (uppercased) looks like a coding-agent marker. Excludes the two
+// value-captured generics (read via agent_hint) and the SSH/GPG "agent" false
+// friends, which are credential agents, not coding agents. No bare `CODING`
+// token — it substring-matches `ENCODING` (e.g. PYTHONIOENCODING) and real
+// coding-agent keys already match via `AGENT` (e.g. PI_CODING_AGENT).
+export const HINT_KEY_PATTERN = /AGENT|ASSISTANT|COPILOT|CODEX|CLAUDE|LLM|_THREAD_ID$|_SESSION_ID$/;
+
+function isDiscoveryHintKey(upperKey: string): boolean {
+  if (upperKey === "AGENT" || upperKey === "AI_AGENT") return false;
+  if (upperKey.startsWith("SSH_") || upperKey.startsWith("GPG_")) return false;
+  if (["NPM_CONFIG_USER_AGENT", "TERM_SESSION_ID", "XDG_SESSION_ID"].includes(upperKey))
+    return false;
+  return HINT_KEY_PATTERN.test(upperKey);
+}
+
+function discoveryHintPriority(key: string): number {
+  // Kubernetes service expansion can otherwise consume the entire hint cap.
+  if (/_SERVICE_(HOST|PORT)(_|$)|_PORT(_\d+_(TCP|UDP)(_(ADDR|PORT|PROTO))?)?$/.test(key)) return 2;
+  if (/^(HARBOR_AGENT|CURSOR_AGENT|ANTIGRAVITY_AGENT)$|_(SESSION_ID|THREAD_ID)$/.test(key))
+    return 0;
+  return 1;
+}
+
+/**
+ * Residual discovery signals for the agent_runtime=null bucket. See the section
+ * comment above for intent and the privacy contract. Pure over process.env.
+ */
+export function detectAgentHints(): AgentHints {
+  const env = process.env;
+  const agent_hint = sanitizeHint(env["AGENT"]) ?? sanitizeHint(env["AI_AGENT"]);
+  const term_program = sanitizeHint(env["TERM_PROGRAM"]);
+
+  const keys = new Set<string>();
+  for (const key of Object.keys(env)) {
+    if (key.length > 64) continue;
+    const upper = key.toUpperCase();
+    if (isDiscoveryHintKey(upper)) keys.add(upper);
+  }
+  const selected = [...keys]
+    .sort((a, b) => discoveryHintPriority(a) - discoveryHintPriority(b) || a.localeCompare(b))
+    .slice(0, 16)
+    .sort();
+  const agent_env_hints = selected.length ? selected.join(",") : null;
+
+  return { agent_hint, term_program, agent_env_hints };
 }
 
 // ---------------------------------------------------------------------------

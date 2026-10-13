@@ -1,3 +1,4 @@
+import { failUsage } from "./commandResult.js";
 /**
  * Pure parsers for `hyperframes render` argv that aren't already shared
  * (fps, quality, format, variables live elsewhere). Lives separately so
@@ -9,9 +10,11 @@
  * `timeout: 0` footguns at the rate of "one per missing branch".
  */
 
+import { readFileSync, type Stats } from "node:fs";
 import { resolve, sep } from "node:path";
-import { type Stats } from "node:fs";
+import { parseFps } from "@hyperframes/core";
 import { errorBox } from "../ui/format.js";
+import { readCompositionFps } from "./compositionFps.js";
 
 // ── --browser-timeout ──────────────────────────────────────────────────
 
@@ -110,9 +113,25 @@ export function resolveBrowserTimeoutMsArg(raw: string | undefined): number | un
   if (!result.ok) {
     const { title, message, hint } = browserTimeoutErrorMessage(result.error);
     errorBox(title, message, hint);
-    process.exit(1);
+    failUsage();
   }
   return result.value;
+}
+
+/**
+ * Navigation budget shared by snapshot/check/inspect browser diagnostics.
+ *
+ * The environment variable remains the historical global override. Callers
+ * with their own timeout knob can supply a minimum without shortening that
+ * override or the existing 10-second default.
+ */
+export function resolveDiagnosticNavigationTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+  minimumTimeoutMs = 0,
+): number {
+  const parsed = Number(env.PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS);
+  const configured = Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+  return Math.max(configured, minimumTimeoutMs);
 }
 
 // ── --composition ──────────────────────────────────────────────────────
@@ -125,6 +144,15 @@ export type CompositionEntryParseError =
 export type CompositionEntryParseResult =
   | { ok: true; value: string | undefined }
   | { ok: false; error: CompositionEntryParseError };
+
+function normalizeCompositionEntryArg(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim().replace(/^\.\//, "") || undefined;
+  return !trimmed || trimmed === "." ? undefined : trimmed;
+}
+
+export function hasExplicitCompositionArg(raw: string | undefined): boolean {
+  return normalizeCompositionEntryArg(raw) !== undefined;
+}
 
 /**
  * Parse and validate `--composition <path>` into a project-relative
@@ -144,11 +172,11 @@ export function parseCompositionEntryArg(
   projectDir: string,
   stat: (path: string) => Stats,
 ): CompositionEntryParseResult {
-  const trimmed = raw?.trim().replace(/^\.\//, "") || undefined;
+  const trimmed = normalizeCompositionEntryArg(raw);
   // Normalize the project-root shorthands to "no entry override" so the
   // producer falls back to index.html instead of statSync-ing the dir
   // and later blowing up with EISDIR inside readFileSync().
-  if (!trimmed || trimmed === ".") return { ok: true, value: undefined };
+  if (!trimmed) return { ok: true, value: undefined };
 
   const absProjectDir = resolve(projectDir);
   const entryPath = resolve(absProjectDir, trimmed);
@@ -215,9 +243,35 @@ export function resolveCompositionEntryArg(
   if (!result.ok) {
     const { title, message, hint } = compositionEntryErrorMessage(result.error);
     errorBox(title, message, hint);
-    process.exit(1);
+    failUsage();
   }
   return result.value;
+}
+
+// ── default fps ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the fps argument that local `render` should parse: explicit --fps,
+ * else the actual composition entry file's root data-fps when valid, else
+ * undefined so the caller can apply its final "30" default.
+ */
+export function resolveDefaultFpsArg(
+  explicitFps: string | undefined,
+  projectDir: string,
+  indexPath: string,
+  entryFile: string | undefined,
+): string | undefined {
+  if (explicitFps != null) return explicitFps;
+  try {
+    const fpsSourcePath = entryFile ? resolve(projectDir, entryFile) : indexPath;
+    const declared = readCompositionFps(readFileSync(fpsSourcePath, "utf8"));
+    if (declared != null && parseFps(declared).ok) {
+      return declared;
+    }
+  } catch {
+    // Unreadable composition file — fall back to the default fps in render.ts.
+  }
+  return undefined;
 }
 
 export type GifLoopParseResult =
@@ -240,6 +294,34 @@ export function parseGifLoopArg(raw: string | undefined): GifLoopParseResult {
     return {
       ok: false,
       message: `Got "${raw}". GIF loop count must be an integer between 0 and 65535.`,
+    };
+  }
+  return { ok: true, value: parsed };
+}
+
+export type HlsSegmentSecondsParseResult =
+  | { ok: true; value: number | undefined }
+  | { ok: false; message: string };
+
+const MAX_HLS_SEGMENT_SECONDS = 60;
+
+/**
+ * Parse and validate `--hls-segment-seconds <n>` (HLS target segment length).
+ * Whole seconds only: the value becomes ffmpeg's `-hls_time`, which writes an
+ * integer `#EXT-X-TARGETDURATION`. Returns `{ ok: true, value: undefined }`
+ * when the flag is absent so the caller can apply the format-dependent default.
+ */
+export function parseHlsSegmentSecondsArg(raw: string | undefined): HlsSegmentSecondsParseResult {
+  if (raw === undefined) return { ok: true, value: undefined };
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, message: "HLS segment length must not be empty." };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_HLS_SEGMENT_SECONDS) {
+    return {
+      ok: false,
+      message: `Got "${raw}". HLS segment length must be a whole number of seconds between 1 and ${MAX_HLS_SEGMENT_SECONDS}.`,
     };
   }
   return { ok: true, value: parsed };

@@ -3,7 +3,10 @@ title: "@hyperframes/parsers"
 description: "The GSAP + HTML parser/writer suite — standalone, zero @hyperframes/* dependencies."
 ---
 
-The parsers package is the standalone foundation extracted from core. It owns the GSAP animation parser/writer (recast **and** acorn implementations), the HTML composition parser, hf-id stamping, and spring-ease generation. It has **no `@hyperframes/*` dependencies**, so it's the base every other package builds on.
+The parsers package owns the GSAP animation parser/writer, HTML composition
+parser, hf-id stamping, and spring-ease generation. It has no
+`@hyperframes/*` runtime dependencies, so it can be used without the rest of
+the framework.
 
 ```bash
 npm install @hyperframes/parsers
@@ -26,6 +29,7 @@ npm install @hyperframes/parsers
 | Import | Description |
 |--------|-------------|
 | `@hyperframes/parsers` | HTML parser, GSAP serialize/validate helpers, hf-ids, shared types |
+| `@hyperframes/parsers/gsap-parser` | GSAP parser exports, `parseGsapScript`, `SUPPORTED_PROPS`, `SUPPORTED_EASES` |
 | `@hyperframes/parsers/gsap-parser-acorn` | Acorn-based GSAP parser (browser-safe, read path) |
 | `@hyperframes/parsers/gsap-writer-acorn` | Acorn-based GSAP writer (mutation helpers) |
 | `@hyperframes/parsers/gsap-parser-recast` | Recast-based GSAP parser/writer (legacy implementation) |
@@ -35,9 +39,11 @@ npm install @hyperframes/parsers
 | `@hyperframes/parsers/slideshow` | Slideshow manifest parser (`parseSlideshowManifest`, `resolveSlideshow`) |
 | `@hyperframes/parsers/composition` | Pure, browser-safe composition primitives (data types, font aliases, URL helper) |
 | `@hyperframes/parsers/asset-paths` | Node-only asset-path rewriting helpers (`rewriteAssetPath`, …) |
+| `@hyperframes/parsers/sub-composition-validity` | Sub-composition validation utilities |
 
 <Info>
-  The package ships subpath entries so consumers tree-shake to what they use — importing `@hyperframes/parsers/hf-ids` (a couple KB) does **not** pull in the GSAP AST machinery (recast/babel/acorn).
+  The package ships focused subpath entries. Import
+  `@hyperframes/parsers/hf-ids` when you do not need the GSAP AST machinery.
 </Info>
 
 ## HTML Parsing
@@ -142,7 +148,7 @@ const withIds = ensureHfIds(htmlString);
 import { generateSpringEaseData, SPRING_PRESETS } from '@hyperframes/parsers/spring-ease';
 ```
 
-## Related Packages
+## Related topics
 
 <CardGroup cols={2}>
   <Card title="@hyperframes/core" icon="cube" href="/packages/core">

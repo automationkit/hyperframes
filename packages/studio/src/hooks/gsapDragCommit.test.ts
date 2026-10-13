@@ -1,14 +1,20 @@
-import { describe, expect, it, beforeEach } from "vitest";
+// @vitest-environment happy-dom
+
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import { commitGsapPositionFromDrag } from "./gsapDragPositionCommit";
 import {
   commitStaticGsapPosition,
   commitStaticGsapRotation,
+  commitStaticGsapSize,
+  findExistingPositionWrite,
+  materializeIfDynamic,
   parkPlayheadOnKeyframe,
   type GsapDragCommitCallbacks,
 } from "./gsapDragCommit";
 import { usePlayerStore } from "../player/store/playerStore";
+import { liveTween, previewWith } from "./gsapParsedTween.test-helpers";
 
 // Minimal selection whose element has no drag-baseline attributes (origX/Y = 0).
 const selection = (): DomEditSelection =>
@@ -22,6 +28,43 @@ const selection = (): DomEditSelection =>
       getBoundingClientRect: () => ({ top: 0, left: 0 }),
     },
   }) as unknown as DomEditSelection;
+
+function selectorlessSelection(): DomEditSelection {
+  return {
+    selector: ".shared",
+    element: document.createElement("div"),
+  } as unknown as DomEditSelection;
+}
+
+describe("lower GSAP commit helpers fail closed", () => {
+  it("rejects instead of silently dropping a static position write without a stable selector", async () => {
+    const commitMutation = vi.fn();
+    await expect(
+      commitStaticGsapPosition(
+        selectorlessSelection(),
+        { x: 10, y: 20 },
+        { x: 0, y: 0 },
+        ".shared",
+        null,
+        { commitMutation },
+      ),
+    ).rejects.toMatchObject({ name: "GsapEditBlockedError", reason: "no-selector" });
+    expect(commitMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects runtime-dynamic materialization instead of rewriting source during a gesture", async () => {
+    const commitMutation = vi.fn();
+    await expect(
+      materializeIfDynamic(
+        { ...flatTween(), hasUnresolvedKeyframes: true },
+        null,
+        commitMutation,
+        selection(),
+      ),
+    ).rejects.toMatchObject({ name: "GsapEditBlockedError", reason: "source-uneditable" });
+    expect(commitMutation).not.toHaveBeenCalled();
+  });
+});
 
 const flatTween = (): GsapAnimation =>
   ({
@@ -69,171 +112,86 @@ function recordingCallbacks(): {
   };
 }
 
-describe("commitGsapPositionFromDrag — flat tween", () => {
-  beforeEach(() => {
-    usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null });
-  });
+describe("commitGsapPositionFromDrag — at a selected keyframe or past the tween", () => {
+  beforeEach(() => usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null }));
+  const puck = () => {
+    const element = document.createElement("div");
+    element.id = "puck-a";
+    return { id: "puck-a", selector: "#puck-a", element } as unknown as DomEditSelection;
+  };
+  const preview = (
+    sel: DomEditSelection,
+    anim: GsapAnimation,
+    ends: Record<string, [number, number]>,
+    from = false,
+  ) =>
+    previewWith(sel.element, [
+      liveTween(
+        sel.element,
+        { start: anim.resolvedStart!, duration: anim.duration!, vars: anim.properties, ends },
+        { from },
+      ),
+    ]);
 
-  it("extends the existing tween (never spawns a parallel one) when dragged OUTSIDE its range", async () => {
-    usePlayerStore.setState({ currentTime: 6 }); // outside [1.2, 3.4]
-    const { types, callbacks } = recordingCallbacks();
-
-    await commitGsapPositionFromDrag(
-      selection(),
-      flatTween(),
-      { x: -100, y: 0 },
-      { x: 0, y: 0 },
-      null,
-      "#puck-a",
-      callbacks,
-    );
-
-    expect(types).toContain("convert-to-keyframes");
-    expect(types).toContain("replace-with-keyframes"); // the extend
-    expect(types).not.toContain("add-with-keyframes"); // regression: no parallel tween
-  });
-
-  it("adds a keyframe at the playhead when dragged INSIDE its range", async () => {
-    usePlayerStore.setState({ currentTime: 2 }); // inside [1.2, 3.4]
-    const { types, callbacks } = recordingCallbacks();
-
-    await commitGsapPositionFromDrag(
-      selection(),
-      flatTween(),
-      { x: -100, y: 0 },
-      { x: 0, y: 0 },
-      null,
-      "#puck-a",
-      callbacks,
-    );
-
-    expect(types).toContain("add-keyframe");
-    expect(types).not.toContain("add-with-keyframes");
-  });
-
-  it("MODIFIES the selected keyframe (no extend) when one is selected, even past the tween end", async () => {
-    // User clicked the 100% diamond (activeKeyframePct=100), playhead drifted past
-    // the end. Expect: convert + add-keyframe AT 100% — not replace-with-keyframes.
+  it("changes the selected keyframe without extending, even with the playhead past the end", async () => {
     usePlayerStore.setState({ currentTime: 6, activeKeyframePct: 100 }); // outside [1.2, 3.4]
-    const { types, mutations, callbacks } = recordingCallbacks();
-
+    const { mutations, callbacks } = recordingCallbacks();
+    const sel = puck();
     await commitGsapPositionFromDrag(
-      selection(),
+      sel,
       flatTween(),
       { x: -100, y: 0 },
       { x: 0, y: 0 },
-      null,
-      "#puck-a",
+      preview(sel, flatTween(), { x: [0, -260] }),
       callbacks,
     );
-
-    expect(types).toContain("add-keyframe");
-    expect(types).not.toContain("replace-with-keyframes"); // not extended
-    const addKf = mutations.find((m) => m.type === "add-keyframe");
-    expect(addKf?.percentage).toBe(100); // modified the selected endpoint
-    // consumed: cleared so the next free drag doesn't keep modifying
+    expect(mutations).toEqual([
+      expect.objectContaining({
+        type: "replace-with-keyframes",
+        position: 1.2,
+        duration: 2.2,
+        easeEach: "power1.out",
+        keyframes: [{ percentage: 100, properties: { x: -100, y: 0 } }],
+      }),
+    ]);
     expect(usePlayerStore.getState().activeKeyframePct).toBeNull();
-    // parked the playhead on the edited keyframe (1.2 start + 100% * 2.2 dur),
-    // so the edit is visible instead of rendering the base pose
     expect(usePlayerStore.getState().requestedSeekTime).toBe(3.4);
   });
-});
 
-describe("commitGsapPositionFromDrag — keyframed tween backfill", () => {
-  beforeEach(() => {
-    usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null });
-  });
-
-  const keyframedTween = (): GsapAnimation =>
-    ({
-      id: "#puck-a-kf",
-      targetSelector: "#puck-a",
-      method: "to",
-      resolvedStart: 1.2,
-      duration: 2.2,
-      keyframes: {
-        keyframes: [
-          { percentage: 0, properties: { x: 0 } },
-          { percentage: 100, properties: { x: -260 } },
-        ],
-      },
-    }) as unknown as GsapAnimation;
-
-  it("passes backfillDefaults so a newly-introduced prop doesn't move the other keyframes", async () => {
-    // Drag the 0% keyframe DOWN (introduces y on an x-only tween). The add-keyframe
-    // must carry backfillDefaults at the element's base so 100% gets y:0, not y:780.
-    usePlayerStore.setState({ currentTime: 1.2, activeKeyframePct: 0 });
-    const { mutations, callbacks } = recordingCallbacks();
-
-    await commitGsapPositionFromDrag(
-      selection(),
-      keyframedTween(),
-      { x: 0, y: 780 }, // studioOffset: dragged straight down
-      { x: 0, y: 0 }, // gsapPos → base falls back to {0,0} (selection has no base attrs)
-      null,
-      "#puck-a",
-      callbacks,
-    );
-
-    const addKf = mutations.find((m) => m.type === "add-keyframe");
-    expect(addKf).toBeDefined();
-    expect(addKf?.percentage).toBe(0); // edited the selected 0% keyframe
-    expect(addKf?.properties).toMatchObject({ y: 780 });
-    expect(addKf?.backfillDefaults).toEqual({ x: 0, y: 0 }); // base → 100% gets y:0
-  });
-});
-
-describe("commitGsapPositionFromDrag — from() tween dragged outside its range", () => {
-  beforeEach(() => usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null }));
-
-  const fromTween = (): GsapAnimation =>
-    ({
-      id: "#title-from-400",
+  it("extends a from() tween to the playhead, keeping its parsed end as the old end", async () => {
+    usePlayerStore.setState({ currentTime: 2.2 }); // outside [0.4, 1.3]
+    const fromTween = {
+      id: "#title-from-400-position",
       targetSelector: "#title",
       method: "from",
+      propertyGroup: "position",
       resolvedStart: 0.4,
       duration: 0.9,
+      ease: "none",
       properties: { y: 70 },
-    }) as unknown as GsapAnimation;
-
-  it("REPLACES the split position from() tween (no parallel tween → no drop jump)", async () => {
-    usePlayerStore.setState({ currentTime: 2.13 }); // outside [0.4, 1.3]
-    const types: string[] = [];
-    const mutations: Array<Record<string, unknown>> = [];
-    const callbacks: GsapDragCommitCallbacks = {
-      commitMutation: async (_s, m) => {
-        types.push(m.type as string);
-        mutations.push(m);
-      },
-      // After split-into-property-groups, the position group is a from() tween (no keyframes).
-      fetchAnimations: async () => [
-        {
-          id: "#title-from-400-position",
-          targetSelector: "#title",
-          method: "from",
-          propertyGroup: "position",
-          resolvedStart: 0.4,
-          duration: 0.9,
-          properties: { y: 70 },
-        } as unknown as GsapAnimation,
-      ],
-    };
-
+    } as unknown as GsapAnimation;
+    const { types, mutations, callbacks } = recordingCallbacks();
+    const sel = puck();
     await commitGsapPositionFromDrag(
-      selection(),
-      fromTween(),
+      sel,
+      fromTween,
       { x: 0, y: -333 },
       { x: 0, y: 0 },
-      null,
-      "#title",
+      preview(sel, fromTween, { y: [70, 0] }, true),
       callbacks,
     );
-
-    expect(types).toContain("split-into-property-groups");
-    expect(types).toContain("replace-with-keyframes");
-    expect(types).not.toContain("add-with-keyframes"); // regression: no parallel tween
-    const replace = mutations.find((m) => m.type === "replace-with-keyframes");
-    expect(replace?.animationId).toBe("#title-from-400-position"); // replaces the split from()
+    expect(types).toEqual(["replace-with-keyframes"]);
+    expect(mutations[0]).toMatchObject({
+      animationId: "#title-from-400-position",
+      position: 0.4,
+      duration: 1.8,
+      easeEach: "none",
+      keyframes: [
+        { percentage: 0, properties: { y: 70, x: 0 } },
+        { percentage: 50, properties: { y: 0, x: 0 } },
+        { percentage: 100, properties: { y: -333, x: 0 } },
+      ],
+    });
   });
 });
 
@@ -275,7 +233,7 @@ const existingRotationSet = (): GsapAnimation =>
 describe("commitStaticGsapPosition — instantPatch (value-only set)", () => {
   beforeEach(() => usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null }));
 
-  it("attaches an instantPatch to BOTH coalesced commits, each derived from its own mutation", async () => {
+  it("updates an existing set atomically and derives its instantPatch from that mutation", async () => {
     const { commits, callbacks } = optionRecordingCallbacks();
 
     await commitStaticGsapPosition(
@@ -287,49 +245,22 @@ describe("commitStaticGsapPosition — instantPatch (value-only set)", () => {
       callbacks,
     );
 
-    expect(commits).toHaveLength(2);
-    // First (x) commit is the intermediate skipReload one — it now carries an
-    // instantPatch for just {x}, so if the SECOND POST fails the preview still
-    // reflects the x that DID persist (no reload, instant feedback).
-    expect(commits[0].options.skipReload).toBe(true);
-    expect(commits[0].options.instantPatch).toEqual({
-      selector: "#puck-a",
-      change: { kind: "set", props: { x: -50 } },
+    expect(commits).toHaveLength(1);
+    expect(commits[0].mutation).toEqual({
+      type: "update-properties",
+      animationId: "#puck-a-set",
+      properties: { x: -50, y: 30 },
     });
-    // Final (y) commit triggers the reload and carries the full {x,y} patch.
-    expect(commits[1].options.softReload).toBe(true);
-    expect(commits[1].options.instantPatch).toEqual({
+    expect(commits[0].options.softReload).toBe(true);
+    expect(commits[0].options.instantPatch).toEqual({
       selector: "#puck-a",
       change: { kind: "set", props: { x: -50, y: 30 } },
     });
-  });
-
-  it("derives each instantPatch's props from the value in the SAME mutation that's POSTed", async () => {
-    const { commits, callbacks } = optionRecordingCallbacks();
-
-    await commitStaticGsapPosition(
-      selection(),
-      { x: -50, y: 30 },
-      { x: 0, y: 0 },
-      "#puck-a",
-      existingPositionSet(),
-      callbacks,
-    );
-
-    // The patch values must equal the mutation values — they're read out of the
-    // same object, so a clean mutation can't ship alongside a stale patch.
-    const xMutation = commits[0].mutation as { property: string; value: number };
-    const yMutation = commits[1].mutation as { property: string; value: number };
-    const xPatch = commits[0].options.instantPatch as {
+    const mutation = commits[0].mutation as { properties: Record<string, number> };
+    const patch = commits[0].options.instantPatch as {
       change: { props: Record<string, number> };
     };
-    const yPatch = commits[1].options.instantPatch as {
-      change: { props: Record<string, number> };
-    };
-    expect(xPatch.change.props[xMutation.property]).toBe(xMutation.value);
-    expect(yPatch.change.props[yMutation.property]).toBe(yMutation.value);
-    // The y commit's combined patch also carries the x mutation's value.
-    expect(yPatch.change.props[xMutation.property]).toBe(xMutation.value);
+    expect(patch.change.props).toEqual(mutation.properties);
   });
 
   it("ADDS a global gsap.set with a global-set instantPatch (off-timeline, no flash)", async () => {
@@ -338,6 +269,7 @@ describe("commitStaticGsapPosition — instantPatch (value-only set)", () => {
     await commitStaticGsapPosition(
       selection(),
       { x: -50, y: 30 },
+      // fallow-ignore-next-line code-duplication
       { x: 0, y: 0 },
       "#puck-a",
       null, // no existing set → `add` a new base gsap.set
@@ -349,6 +281,179 @@ describe("commitStaticGsapPosition — instantPatch (value-only set)", () => {
     expect((commits[0].mutation as { global?: boolean }).global).toBe(true);
     const patch = commits[0].options.instantPatch as { change: { kind: string } } | undefined;
     expect(patch?.change.kind).toBe("global-set");
+  });
+
+  it("creates one undo entry when updating an existing static position set", async () => {
+    const { commits, callbacks } = optionRecordingCallbacks();
+
+    await commitStaticGsapPosition(
+      selection(),
+      { x: -50, y: 30 },
+      { x: 0, y: 0 },
+      "#puck-a",
+      existingPositionSet(),
+      callbacks,
+    );
+
+    expect(commits).toHaveLength(1);
+  });
+});
+
+const existingSizeSet = (): GsapAnimation =>
+  ({
+    id: "#puck-a-size-set",
+    targetSelector: "#puck-a",
+    method: "set",
+    properties: { width: 100, height: 80 },
+  }) as unknown as GsapAnimation;
+
+describe("commitStaticGsapSize", () => {
+  it("updates an existing set with one update-properties mutation", async () => {
+    const { commits, callbacks } = optionRecordingCallbacks();
+
+    await commitStaticGsapSize(
+      selection(),
+      { width: 300.4, height: 199.6 },
+      "#puck-a",
+      existingSizeSet(),
+      callbacks,
+    );
+
+    expect(commits).toHaveLength(1);
+    expect(commits[0].mutation).toEqual({
+      type: "update-properties",
+      animationId: "#puck-a-size-set",
+      properties: { width: 300, height: 200 },
+    });
+    expect(commits.map((commit) => commit.mutation.type)).not.toContain("delete");
+    expect(commits.map((commit) => commit.mutation.type)).not.toContain("add");
+  });
+
+  it("adds exactly one set when no existing size set exists", async () => {
+    const { commits, callbacks } = optionRecordingCallbacks();
+
+    await commitStaticGsapSize(
+      selection(),
+      { width: 300, height: 200 },
+      "#puck-a",
+      null,
+      callbacks,
+    );
+
+    expect(commits).toHaveLength(1);
+    expect(commits[0].mutation).toMatchObject({
+      type: "add",
+      targetSelector: "#puck-a",
+      method: "set",
+      properties: { width: 300, height: 200 },
+    });
+  });
+
+  it("creates one undo entry for an existing static size set", async () => {
+    const { commits, callbacks } = optionRecordingCallbacks();
+
+    await commitStaticGsapSize(
+      selection(),
+      { width: 300, height: 200 },
+      "#puck-a",
+      existingSizeSet(),
+      callbacks,
+    );
+
+    expect(commits).toHaveLength(1);
+  });
+});
+
+// A degenerate `tl.to("#el",{keyframes:{...},duration:0})` — what a pre-fix drag
+// left behind when it routed a STATIC position hold (sitting beside a keyframed
+// rotation) into the keyframe branch. A duration-0 keyframed tween renders its
+// final keyframe at every playhead, so the element froze and "couldn't move".
+const keyframedZeroDurationHold = (): GsapAnimation =>
+  ({
+    id: "#puck-a-frozen",
+    targetSelector: "#puck-a",
+    method: "to",
+    propertyGroup: "position",
+    duration: 0,
+    keyframes: {
+      keyframes: [
+        { percentage: 0, properties: { x: 100, y: 50 } },
+        { percentage: 100, properties: { x: -260, y: -70 } },
+      ],
+    },
+    properties: {},
+  }) as unknown as GsapAnimation;
+
+describe("static position hold recognition + heal (frozen duration-0 keyframed tween)", () => {
+  beforeEach(() => usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null }));
+
+  it("findExistingPositionWrite recognizes a keyframed zero-duration position hold", () => {
+    const found = findExistingPositionWrite([keyframedZeroDurationHold()], "#puck-a");
+    expect(found?.id).toBe("#puck-a-frozen");
+  });
+
+  it("heals a keyframed hold with one transaction ordered add before delete", async () => {
+    const { commits, callbacks } = optionRecordingCallbacks();
+
+    await commitStaticGsapPosition(
+      selection(),
+      { x: -50, y: 30 },
+      { x: 0, y: 0 },
+      "#puck-a",
+      keyframedZeroDurationHold(),
+      callbacks,
+    );
+
+    const types = commits.map((c) => c.mutation.type);
+    expect(types).toEqual(["add", "delete"]);
+    expect(types).not.toContain("update-properties");
+    expect((commits[0].mutation as { method?: string }).method).toBe("set");
+    expect(commits[0].options.coalesceKey).toBe(commits[1].options.coalesceKey);
+    expect(commits[0].options.coalesceKey).toMatch(/^tx:Move layer:\d+$/);
+  });
+
+  it("keeps the original hold when the replacement add fails", async () => {
+    const mutationTypes: string[] = [];
+    const callbacks: GsapDragCommitCallbacks = {
+      commitMutation: async (_selection, mutation) => {
+        mutationTypes.push(mutation.type as string);
+        throw new Error("add failed");
+      },
+    };
+
+    await expect(
+      commitStaticGsapPosition(
+        selection(),
+        { x: -50, y: 30 },
+        { x: 0, y: 0 },
+        "#puck-a",
+        keyframedZeroDurationHold(),
+        callbacks,
+      ),
+    ).rejects.toThrow("add failed");
+    expect(mutationTypes).toEqual(["add"]);
+  });
+
+  it("leaves a recoverable duplicate when delete fails after the replacement add", async () => {
+    let holdCount = 1;
+    const callbacks: GsapDragCommitCallbacks = {
+      commitMutation: async (_selection, mutation) => {
+        if (mutation.type === "add") holdCount += 1;
+        if (mutation.type === "delete") throw new Error("delete failed");
+      },
+    };
+
+    await expect(
+      commitStaticGsapPosition(
+        selection(),
+        { x: -50, y: 30 },
+        { x: 0, y: 0 },
+        "#puck-a",
+        keyframedZeroDurationHold(),
+        callbacks,
+      ),
+    ).rejects.toThrow("delete failed");
+    expect(holdCount).toBe(2);
   });
 });
 
@@ -377,6 +482,7 @@ describe("commitStaticGsapRotation — instantPatch (value-only set)", () => {
   it("ADDS a global gsap.set with a global-set instantPatch (off-timeline, no flash)", async () => {
     const { commits, callbacks } = optionRecordingCallbacks();
 
+    // fallow-ignore-next-line code-duplication
     await commitStaticGsapRotation(selection(), 42, "#puck-a", null, callbacks);
 
     expect(commits).toHaveLength(1);
@@ -387,32 +493,31 @@ describe("commitStaticGsapRotation — instantPatch (value-only set)", () => {
   });
 });
 
-describe("commitGsapPositionFromDrag — keyframe/structural commits omit instantPatch", () => {
+describe("commitGsapPositionFromDrag — keyframe commits omit instantPatch", () => {
   beforeEach(() => usePlayerStore.setState({ currentTime: 0, activeKeyframePct: null }));
 
-  it("a structural keyframe drag (convert-to-keyframes → add-keyframe) sets no instantPatch", async () => {
-    usePlayerStore.setState({ currentTime: 2 }); // inside [1.2, 3.4] → convert + add-keyframe
+  it("a keyframe drag relies on the soft reload, not the instant patch", async () => {
+    usePlayerStore.setState({ currentTime: 2 }); // inside [1.2, 3.4]
     const { commits, callbacks } = optionRecordingCallbacks();
-
+    const element = document.createElement("div");
+    const sel = { id: "puck-a", selector: "#puck-a", element } as unknown as DomEditSelection;
+    const live = liveTween(element, {
+      start: 1.2,
+      duration: 2.2,
+      vars: { x: -260 },
+      ends: { x: [0, -260] },
+    });
     await commitGsapPositionFromDrag(
-      selection(),
+      sel,
       flatTween(),
       { x: -100, y: 0 },
       { x: 0, y: 0 },
-      null,
-      "#puck-a",
+      previewWith(element, [live]),
       callbacks,
     );
-
-    // The keyframe path is structural here (convert + add-keyframe) and must rely
-    // on the soft reload — none of its commits opt into the instant patch.
-    expect(commits.length).toBeGreaterThan(0);
-    for (const c of commits) {
-      expect(c.options.instantPatch).toBeUndefined();
-    }
-    const types = commits.map((c) => c.mutation.type);
-    expect(types).toContain("convert-to-keyframes");
-    expect(types).toContain("add-keyframe");
+    expect(commits.map((c) => c.mutation.type)).toEqual(["replace-with-keyframes"]);
+    expect(commits[0]!.options.instantPatch).toBeUndefined();
+    expect(commits[0]!.options.softReload).toBe(true);
   });
 });
 

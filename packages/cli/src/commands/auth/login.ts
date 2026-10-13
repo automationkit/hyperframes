@@ -1,3 +1,5 @@
+import { failCommand, failUsage } from "../../utils/commandResult.js";
+import { envFlagEnabled, isAttendedTerminal } from "../../utils/attendedTerminal.js";
 /**
  * `hyperframes auth login` — sign in to HeyGen.
  *
@@ -34,9 +36,11 @@ import {
   isUserInfoEmpty,
   readStore,
   refreshTokens,
+  revokeTokens,
   saveUserInfo,
+  persistVerifiedOAuthSession,
   startAuthorizationCodeFlow,
-  tryResolveCredential,
+  startDeviceAuthorizationFlow,
   userDisplayName,
   writeStore,
   type Credentials,
@@ -62,39 +66,174 @@ export default defineCommand({
       type: "string",
       description: "API key value, or pass `--api-key` with no value to read from stdin / prompt.",
     },
+    device: {
+      type: "boolean",
+      description: "Use an attended device code (for SSH/headless terminals; never for CI).",
+    },
   },
   // fallow-ignore-next-line complexity
   async run({ args }) {
     const inlineKey = args["api-key"];
+    if (inlineKey !== undefined && args.device) {
+      console.error(c.error("Choose either --device or --api-key, not both."));
+      failUsage();
+    }
     if (inlineKey !== undefined) {
       await runApiKeyLogin(inlineKey);
       return;
+    }
+    if (args.device) {
+      await runDeviceLogin();
+      return;
+    }
+    if (isRemoteOrHeadless()) {
+      console.error(
+        c.error(
+          "Browser callback login is unavailable in this remote/headless terminal. Run `hyperframes auth login --device`.",
+        ),
+      );
+      failUsage();
     }
     await runOAuthLogin();
   },
 });
 
+function isRemoteOrHeadless(): boolean {
+  const remoteEnvironment = [
+    "CODESPACES",
+    "GITHUB_CODESPACES",
+    "REMOTE_CONTAINERS",
+    "GITPOD_WORKSPACE_ID",
+    "container",
+  ].some(envFlagEnabled);
+  return Boolean(
+    process.env["SSH_CONNECTION"] ||
+    process.env["SSH_CLIENT"] ||
+    process.env["SSH_TTY"] ||
+    process.env["BROWSER"] === "none" ||
+    process.env["HF_NO_BROWSER"] === "1" ||
+    remoteEnvironment ||
+    process.stdout.isTTY !== true,
+  );
+}
+
+function assertAttendedDeviceFlow(): void {
+  if (!isAttendedTerminal()) {
+    console.error(
+      c.error(
+        "`--device` requires an attended terminal and is disabled in CI. Use an API key or workload credential for automation.",
+      ),
+    );
+    failUsage();
+  }
+}
+
+async function runDeviceLogin(): Promise<void> {
+  assertAttendedDeviceFlow();
+  assertOAuthConfiguredOrExit();
+  const { trackAuthLoginStarted, trackAuthLoginCompleted, trackAuthLoginFailed, identifyUser } =
+    await import("../../telemetry/index.js");
+  trackAuthLoginStarted("device");
+
+  let tokens;
+  try {
+    tokens = await startDeviceAuthorizationFlow({
+      onChallenge: ({ verificationUri, verificationUriComplete, userCode }) => {
+        console.log(`Open ${c.accent(verificationUriComplete ?? verificationUri)} in a browser.`);
+        if (!verificationUriComplete) console.log(`Enter code ${c.bold(userCode)}.`);
+        console.log(c.dim("Waiting for approval…"));
+      },
+    });
+  } catch (err) {
+    const message = (err as Error).message || "Device authorization failed.";
+    trackAuthLoginFailed("device", /expired/i.test(message) ? "flow_timeout" : "flow_error");
+    console.error(c.error(message));
+    failCommand();
+  }
+
+  let user: UserInfo;
+  try {
+    user = await new AuthClient().getCurrentUser(issuedCredential(tokens));
+  } catch (err) {
+    await revokeDeviceTokens(tokens);
+    trackAuthLoginFailed("device", "rejected");
+    console.error(
+      c.error(
+        `HeyGen could not verify the approved device session; no credential was saved. ${(err as Error).message}`,
+      ),
+    );
+    failCommand();
+  }
+
+  try {
+    await persistVerifiedOAuthSession(tokens, toStoredUserInfo(user));
+  } catch (err) {
+    await revokeDeviceTokens(tokens);
+    trackAuthLoginFailed("device", "flow_error");
+    console.error(
+      c.error(
+        `Could not save the verified device session; it was revoked. ${(err as Error).message}`,
+      ),
+    );
+    failCommand();
+  }
+
+  const id = identityKey(user);
+  if (id) identifyUser(id);
+  trackAuthLoginCompleted("device", id);
+  const identity = userDisplayName(toStoredUserInfo(user)) ?? "(unknown user)";
+  console.log(c.success(`✓ Signed in as ${identity}.`));
+}
+
+// The tokens this login just issued, never a resolved credential: an env credential would outrank them.
+function issuedCredential(tokens: { access_token: string; refresh_token?: string }) {
+  return {
+    type: "oauth" as const,
+    access_token: tokens.access_token,
+    ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
+    source: "file_json" as const,
+    refreshable: false,
+  };
+}
+
+async function revokeDeviceTokens(tokens: {
+  access_token: string;
+  refresh_token?: string;
+}): Promise<void> {
+  await revokeTokens(tokens.access_token, { token_type_hint: "access_token" });
+  if (tokens.refresh_token) {
+    await revokeTokens(tokens.refresh_token, {
+      token_type_hint: "refresh_token",
+    });
+  }
+}
+
 // fallow-ignore-next-line complexity
 async function runOAuthLogin(): Promise<void> {
   assertOAuthConfiguredOrExit();
 
+  const { trackAuthLoginStarted, trackAuthLoginFailed } = await import("../../telemetry/index.js");
+  trackAuthLoginStarted("oauth");
+
+  let tokens;
   try {
-    await startAuthorizationCodeFlow();
+    ({ tokens } = await startAuthorizationCodeFlow());
   } catch (err) {
-    console.error(c.error(`Sign-in failed: ${(err as Error).message}`));
-    process.exit(1);
+    const message = (err as Error).message ?? "";
+    // The loopback server rejects with "OAuth callback timed out after …" when
+    // the user never completes the browser step (closed the tab / walked away).
+    // That is the dominant non-error dropout, so split it from real failures
+    // (IdP misconfig, network) instead of lumping everything as flow_error.
+    trackAuthLoginFailed("oauth", /timed out/i.test(message) ? "flow_timeout" : "flow_error");
+    console.error(c.error(`Sign-in failed: ${message}`));
+    failCommand();
   }
 
-  await reportIdentity();
+  await reportIdentity(issuedCredential(tokens));
 }
 
-// fallow-ignore-next-line complexity
-async function reportIdentity(): Promise<void> {
-  const credential = await tryResolveCredential();
-  if (!credential) {
-    console.error(c.warn("Sign-in completed but no credential was persisted."));
-    process.exit(1);
-  }
+async function reportIdentity(credential: ReturnType<typeof issuedCredential>): Promise<void> {
+  const { trackAuthLoginCompleted, identifyUser } = await import("../../telemetry/index.js");
   // Wire the refresh hook here too — a freshly-minted token shouldn't
   // need it, but a fast IdP-side rotation (or a misconfigured short
   // TTL) shouldn't punish the user with a hard failure when the
@@ -108,18 +247,40 @@ async function reportIdentity(): Promise<void> {
     // `auth status` can show "Logged in as ..." without re-hitting
     // /v3/users/me. Best-effort — a persist failure never fails the login.
     await persistUserInfo(user);
+    // Attribute this install to the signed-in account (and stitch its prior
+    // anonymous usage) before recording completion, so the completed event
+    // carries the identity. Both no-op under the telemetry opt-out.
+    const id = identityKey(user);
+    if (id) identifyUser(id);
+    trackAuthLoginCompleted("oauth", id);
     const identity = userDisplayName(toStoredUserInfo(user)) ?? "(unknown user)";
     console.log(c.success(`✓ Signed in as ${identity}.`));
   } catch (err) {
     // Don't roll back — the OAuth tokens are valid on disk; this is a
-    // transient verify-side issue. The identity probe failed, so any
-    // stale user block from a prior login (possibly a DIFFERENT account)
-    // is cleared so `auth status` can't surface the wrong identity.
+    // transient verify-side issue. The credential is persisted and usable, so
+    // the sign-in still COMPLETED; we just have no resolved identity to
+    // attribute it to. The stale user block from a prior login (possibly a
+    // DIFFERENT account) is cleared so `auth status` can't surface it.
     await clearUserInfoBestEffort();
+    trackAuthLoginCompleted("oauth");
     console.error(
       c.warn(`Signed in. Identity check failed (transient): ${(err as Error).message}`),
     );
   }
+}
+
+/**
+ * The stable key we associate this install with in telemetry after sign-in.
+ * `/v3/users/me` exposes no opaque user_id, so we key on the HeyGen account
+ * EMAIL — the canonical account identifier and the reliable join key back to
+ * billing — falling back to username only when the account exposes no email.
+ * (Username is NOT a privacy win — HeyGen usernames are frequently email-shaped
+ * — it is purely a fallback so an emailless account is still attributable.)
+ * The privacy notice (showTelemetryNotice) and docs/packages/cli.mdx disclose
+ * both, so keep them in sync with whatever this returns.
+ */
+function identityKey(user: UserInfo): string | undefined {
+  return user.email ?? user.username;
 }
 
 /** Project the API `/v3/users/me` view onto the on-disk identity block. */
@@ -163,32 +324,54 @@ async function clearUserInfoBestEffort(): Promise<void> {
 
 // fallow-ignore-next-line complexity
 async function runApiKeyLogin(inlineKey: string): Promise<void> {
-  const key = await collectApiKey(inlineKey);
+  const { trackAuthLoginStarted, trackAuthLoginCompleted, trackAuthLoginFailed, identifyUser } =
+    await import("../../telemetry/index.js");
+  trackAuthLoginStarted("api_key");
+
+  // collectApiKey throws when the user cancels the interactive prompt (Ctrl-C)
+  // or when no key arrives on stdin before the timeout — both are "user walked
+  // away", the abandonment signal we most want. Record it before the error
+  // propagates so `started` still reconciles to `completed + failed`.
+  let key: string;
+  try {
+    key = await collectApiKey(inlineKey);
+  } catch (err) {
+    trackAuthLoginFailed("api_key", "aborted");
+    console.error(c.error((err as Error).message || "Sign-in aborted."));
+    failCommand();
+  }
   if (!key) {
+    trackAuthLoginFailed("api_key", "invalid_input");
     console.error(c.error("No API key provided."));
-    process.exit(1);
+    failCommand();
   }
   if (!isHeaderSafe(key)) {
     // CR/LF in the value would smuggle headers when the key is sent
     // via `x-api-key`. The backend handles "wrong key" itself, but
     // header-injection has to be caught here.
+    trackAuthLoginFailed("api_key", "invalid_input");
     console.error(c.error("API key must not contain newline or control characters."));
-    process.exit(1);
+    failCommand();
   }
   if (key.length < MIN_KEY_LENGTH) {
+    trackAuthLoginFailed("api_key", "invalid_input");
     console.error(c.error(`API key looks too short (got ${key.length} chars).`));
-    process.exit(1);
+    failCommand();
   }
 
   const previous = await snapshotStore();
   const next: Credentials = { ...previous, api_key: key };
   await writeStore(next);
 
-  const verifyOk = await verifyAndReport(key);
-  if (!verifyOk) {
+  const user = await verifyAndReport(key);
+  if (!user) {
+    trackAuthLoginFailed("api_key", "rejected");
     await rollback(previous);
-    process.exit(1);
+    failCommand();
   }
+  const id = identityKey(user);
+  if (id) identifyUser(id);
+  trackAuthLoginCompleted("api_key", id);
 }
 
 async function snapshotStore(): Promise<Credentials> {
@@ -222,17 +405,24 @@ async function rollback(previous: Credentials): Promise<void> {
   }
 }
 
+// Returns the verified user on success (so the caller can attribute the
+// completed sign-in to that identity), or null when the backend rejects the
+// key. Other errors propagate.
 // fallow-ignore-next-line complexity
-async function verifyAndReport(key: string): Promise<boolean> {
+async function verifyAndReport(key: string): Promise<UserInfo | null> {
   const client = new AuthClient();
   try {
-    const user = await client.getCurrentUser({ type: "api_key", key, source: "file_json" });
+    const user = await client.getCurrentUser({
+      type: "api_key",
+      key,
+      source: "file_json",
+    });
     // Persist the friendly-display block next to the now-verified api_key
     // so `auth status` can show a recognizable identity. Best-effort.
     await persistUserInfo(user);
     const identity = userDisplayName(toStoredUserInfo(user)) ?? "(unknown user)";
     console.log(c.success(`✓ API key saved. Authenticated as ${identity}.`));
-    return true;
+    return user;
   } catch (err) {
     if (isAuthError(err) && err.code === "UNAUTHENTICATED") {
       console.error(
@@ -240,7 +430,7 @@ async function verifyAndReport(key: string): Promise<boolean> {
           `  ${c.dim(err.message)}\n` +
           `Run ${c.accent("hyperframes auth login --api-key")} again with a valid key.`,
       );
-      return false;
+      return null;
     }
     throw err;
   }
@@ -288,8 +478,9 @@ async function promptForKey(): Promise<string> {
     },
   });
   if (clack.isCancel(value)) {
-    console.error("Aborted.");
-    process.exit(1);
+    // Throw rather than exit here so the single catch in runApiKeyLogin records
+    // the abandonment (auth_login_failed: aborted) and then exits.
+    throw new Error("Aborted.");
   }
   return value.trim();
 }

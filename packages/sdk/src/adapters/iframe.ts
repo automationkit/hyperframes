@@ -26,15 +26,34 @@
  *   only when currentSrc/dimensions change. Phase 1 is optimized for static images.
  * - Phase 2 (full per-pixel alpha via drawElement rasterization) is NOT built
  *   here — gated on a perf spike.
+ *
+ * Paint query (isProvablyEmptyAt):
+ * - Answers "is this point provably free of ink", which is a different question from
+ *   "what element is here" and needs a different traversal. elementsFromPoint omits
+ *   `pointer-events: none` nodes; those still paint, so a paint query built on the
+ *   z-stack reports no ink over visible artwork. The walk therefore covers element
+ *   BOXES geometrically and is blind to pointer-events and z-index.
+ * - Ink itself is a computed-style heuristic (background, border, own text, intrinsic
+ *   media) EXCEPT for <img>, which routes through the alpha sampler above — so a
+ *   transparent PNG only paints where its pixels do.
  */
 
-import type { PreviewAdapter, ElementAtPointResult, DraftProps } from "./types.js";
-import type { EditOp } from "../types.js";
-
-// ─── CSS var names written onto elements during drag ─────────────────────────
-
-const VAR_DX = "--hf-studio-dx";
-const VAR_DY = "--hf-studio-dy";
+import {
+  EDIT_BASE_X_ATTR,
+  EDIT_BASE_Y_ATTR,
+  EDIT_ORIGINAL_TRANSLATE_ATTR,
+  applyPositionEditToElement,
+  composeTranslate,
+  readCurrentTranslate,
+} from "@hyperframes/core/runtime/position-edits";
+import type {
+  PreviewAdapter,
+  ElementAtPointResult,
+  DraftProps,
+  PaintQueryOptions,
+} from "./types.js";
+import type { EditOp, Composition } from "../types.js";
+import { applyPatchesToDocument, applyOverrideSet } from "../engine/apply-patches.js";
 
 // ─── Pure resolver (testable without a browser) ───────────────────────────────
 
@@ -370,11 +389,14 @@ function hasRotationOrSkew(el: Element | null, win: Window & typeof globalThis):
  * element which lives in the iframe's document.
  */
 // fallow-ignore-next-line complexity
-function imageAlphaOpaqueAt(
+export function imageAlphaOpaqueAt(
   img: HTMLImageElement,
   clientX: number,
   clientY: number,
   win: Window & typeof globalThis,
+  /** Set to true only when pixels were actually read (or the point provably missed the
+   *  rendered image). Lets callers tell a measured answer from a fail-safe assumption. */
+  probe?: { sampled: boolean },
 ): boolean {
   // Not loaded yet — treat as opaque (safe fallback)
   if (img.naturalWidth === 0 || img.naturalHeight === 0) return true;
@@ -421,8 +443,12 @@ function imageAlphaOpaqueAt(
   );
 
   // Point is outside the rendered image area — not this image's pixel.
-  // Continue the z-stack (return false = miss on this element).
-  if (mapped === null) return false;
+  // Continue the z-stack (return false = miss on this element). Geometric certainty,
+  // so it counts as sampled.
+  if (mapped === null) {
+    if (probe) probe.sampled = true;
+    return false;
+  }
 
   // Retrieve or build the offscreen canvas. Key on src + natural dimensions: a
   // srcset/responsive layout can serve the same URL at a different natural size,
@@ -459,6 +485,7 @@ function imageAlphaOpaqueAt(
     // The mapped-pixel read also surfaces lazy canvas taint (SecurityError),
     // so no separate taint probe is needed.
     const data = ctx.getImageData(mapped.px, mapped.py, 1, 1);
+    if (probe) probe.sampled = true;
     return alphaIsOpaque(data);
   } catch {
     // Taint discovered on getImageData — update cache and fall back opaque.
@@ -466,6 +493,296 @@ function imageAlphaOpaqueAt(
     cacheCanvas(cacheKey, null);
     return true;
   }
+}
+
+// ─── Paint query ──────────────────────────────────────────────────────────────
+
+/**
+ * Elements that paint by virtue of what they are, whatever their CSS says.
+ *
+ * `img` and `picture` look redundant against the branches above them in `elementPaintsInk`,
+ * and are not: those branches need a `point` to sample alpha against, so a point-free call
+ * ("could this paint at all?") falls through to this set — as does any environment without
+ * `window.HTMLImageElement`. The set is also exported, where it reads as a description of
+ * intrinsic painters rather than a switch in one function.
+ */
+export const INTRINSIC_PAINT_TAGS: ReadonlySet<string> = new Set([
+  "img",
+  "picture",
+  "video",
+  "canvas",
+  "svg",
+]);
+
+/**
+ * Does this computed colour put down no ink?
+ *
+ * The `transparent` keyword computes to `rgba(0, 0, 0, 0)`, but ANY colour can carry a zero
+ * alpha — `rgba(255, 255, 255, 0)` is exactly as invisible and is what you get from fading a
+ * white background out. Matching known spellings misses those, so the alpha is read instead.
+ */
+function isTransparentColor(value: string): boolean {
+  if (!value || value === "transparent") return true;
+  // rgb/hsl and their -a forms all carry alpha as the fourth component. Computed
+  // background-color is serialized to rgb() by every engine we target, but matching both
+  // costs one alternation and removes the dependency on that.
+  const inner = /^(?:rgba?|hsla?)\(([^)]*)\)$/.exec(value)?.[1];
+  if (inner === undefined) return false;
+  // Handles both the legacy comma form and the `rgb(r g b / a)` slash form.
+  const parts = inner.split(/[\s,/]+/).filter(Boolean);
+  // An rgb() with no alpha component is fully opaque.
+  const alpha = parts[3];
+  return alpha !== undefined && Number.parseFloat(alpha) === 0;
+}
+
+const BORDER_SIDES = ["top", "right", "bottom", "left"] as const;
+
+/**
+ * The element's OWN non-whitespace text — a direct child text node, not text that
+ * lives in a descendant. A wrapper around a caption doesn't paint; the caption does.
+ * Without this, every ancestor of a text node would count and the whole frame would
+ * read as painted.
+ */
+function hasOwnText(el: Element): boolean {
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === 3 /* TEXT_NODE */ && (node.textContent ?? "").trim() !== "") return true;
+  }
+  return false;
+}
+
+/**
+ * Does this element put ink on the frame, and — when `point` is supplied and the
+ * element is an image — ink at that specific point?
+ *
+ * Mostly a heuristic over computed style, because a composition's ordinary elements
+ * cannot be sampled without rasterizing them. `<img>` is the exception: the alpha
+ * sampler above reads the actual pixel, so a transparent PNG paints only where its
+ * pixels do. `<picture>` defers to the `<img>` it wraps, since the wrapper itself
+ * paints nothing.
+ *
+ * KNOWN OVER-COUNT: a `background-image` that is itself mostly transparent reads as
+ * painting across its whole box. Narrowing it needs a second sampling path (resolve
+ * the `url()`, load it, map through background-size/position). Erring toward "paints"
+ * is the safe direction — the cost is a click that selects the composition, not a
+ * click that vanishes.
+ *
+ * Transparency by CSS (`display: none`, `visibility: hidden`, `opacity: 0`) is NOT
+ * handled here; `compositionPaintsAt` filters those before asking.
+ */
+/**
+ * How an element's ink was established.
+ *
+ * `"verified"` means pixels were read. `"inferred"` means computed style says something
+ * paints across the box — true of a `background-image` that is mostly transparent, and of
+ * an image whose pixels could not be sampled. The distinction is what lets the full-bleed
+ * veto discount assumed box-filling paint without discarding a measured pixel.
+ */
+type InkKind = "none" | "verified" | "inferred";
+
+/** Any side with a drawn border — a style that renders and a non-zero width. */
+function hasVisibleBorder(cs: CSSStyleDeclaration): boolean {
+  for (const side of BORDER_SIDES) {
+    const style = cs.getPropertyValue(`border-${side}-style`);
+    const width = Number.parseFloat(cs.getPropertyValue(`border-${side}-width`) || "0");
+    if (style && style !== "none" && style !== "hidden" && width > 0) return true;
+  }
+  return false;
+}
+
+/** Computed-style ink: background, border, or the element's own text. */
+function styleInk(el: Element, win: Window & typeof globalThis): InkKind {
+  const cs = win.getComputedStyle(el);
+
+  if (!isTransparentColor(cs.backgroundColor)) return "inferred";
+  if (cs.backgroundImage && cs.backgroundImage !== "none") return "inferred";
+  if (hasVisibleBorder(cs)) return "inferred";
+
+  return hasOwnText(el) ? "inferred" : "none";
+}
+
+function inkAt(
+  el: Element,
+  win: Window & typeof globalThis,
+  point?: { x: number; y: number },
+): InkKind {
+  const tag = el.tagName.toLowerCase();
+
+  if (tag === "picture") {
+    const img = el.querySelector("img");
+    return img ? inkAt(img, win, point) : "inferred";
+  }
+
+  if (point && win.HTMLImageElement && el instanceof win.HTMLImageElement) {
+    const probe = { sampled: false };
+    if (imageAlphaOpaqueAt(el, point.x, point.y, win, probe)) {
+      // An unsampled "opaque" is the fail-safe, not a measurement, so it stays inferred.
+      return probe.sampled ? "verified" : "inferred";
+    }
+    // A clear pixel does not settle the element: its own background plate, padding and
+    // border still paint, and the point may have landed on them rather than the bitmap.
+    return styleInk(el, win);
+  }
+
+  if (INTRINSIC_PAINT_TAGS.has(tag)) return "inferred";
+
+  return styleInk(el, win);
+}
+
+export function elementPaintsInk(
+  el: Element,
+  win: Window & typeof globalThis,
+  point?: { x: number; y: number },
+): boolean {
+  return inkAt(el, win, point) !== "none";
+}
+
+interface PaintCandidate {
+  el: Element;
+  area: number;
+  depth: number;
+}
+
+/**
+ * Area of the composition frame the point sits in — what a full-bleed layer is measured
+ * against. Nested sub-compositions carry `data-composition-id` too, so the innermost
+ * root CONTAINING the point wins.
+ *
+ * Containment is the load-bearing part. Taking the smallest root in the document
+ * regardless of where the point falls lets an unrelated sub-composition elsewhere on the
+ * frame shrink the reference: a 300x300 badge in a corner would make every mid-size
+ * painter in the 1920x1080 outer frame read as full-bleed, and the composition would go
+ * click-through under artwork the user can plainly see.
+ *
+ * Infinity when no root contains the point, which disables the full-bleed rule rather
+ * than guessing at a frame.
+ */
+function compositionFrameArea(doc: Document, x: number, y: number): number {
+  let smallest = Infinity;
+  doc.querySelectorAll("[data-composition-id]").forEach((root) => {
+    const rect = root.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    if (!boxContains(rect, x, y)) return;
+    smallest = Math.min(smallest, rect.width * rect.height);
+  });
+  return smallest;
+}
+
+function boxContains(rect: DOMRect, x: number, y: number): boolean {
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+/**
+ * Is the element rendered at all?
+ *
+ * `display: none` is checked belt-and-braces: a real engine collapses the box and the area
+ * guard already rejects it, so the clause only earns its place against hosts that report a
+ * box anyway. `visibility` and `opacity` genuinely need it, and opacity has to be read up
+ * the ancestor chain — a fully opaque child inside a fade-in wrapper that has not started
+ * yet is invisible, and getComputedStyle does not multiply the cascade for us.
+ */
+function isRenderedVisible(el: Element, win: Window & typeof globalThis): boolean {
+  const cs = win.getComputedStyle(el);
+  if (cs.display === "none" || cs.visibility === "hidden") return false;
+  return isOpacityVisible(el, win);
+}
+
+function depthOf(el: Element): number {
+  let depth = 0;
+  for (let p = el.parentElement; p; p = p.parentElement) depth++;
+  return depth;
+}
+
+/**
+ * `el` as a paint candidate for the point, or null when it cannot contribute ink
+ * there. Ink itself is NOT tested here — that is the expensive part, deferred until
+ * the candidates are ordered.
+ */
+function paintCandidateAt(
+  el: Element,
+  win: Window & typeof globalThis,
+  x: number,
+  y: number,
+): PaintCandidate | null {
+  // Composition roots are candidates like anything else: a root carrying a background is
+  // painting, and at fullBleedFraction 0 the literal ink question has to say so. They are
+  // not excluded here because the veto already handles them — a root's box IS the frame,
+  // so any non-zero fraction discounts it as background without a special case.
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  if (!boxContains(rect, x, y)) return null;
+  if (!isRenderedVisible(el, win)) return null;
+
+  return { el, area: rect.width * rect.height, depth: depthOf(el) };
+}
+
+/**
+ * Does the composition in `doc` put ink at (x, y)?
+ *
+ * A GEOMETRIC walk, not a z-stack one: every element whose border box contains the
+ * point is a candidate, regardless of pointer-events, z-index, or what paints over
+ * it. That is what makes the answer "is there artwork here" rather than "what would
+ * receive this click" — an author's `pointer-events: none` overlay still paints.
+ *
+ * Candidates are ordered smallest-box-first (deeper node wins a near-tie, matching
+ * the way a host picks the most specific element) and ink is evaluated lazily down
+ * that order, so the common case costs at most one alpha sample rather than one per
+ * candidate.
+ *
+ * Exported so a host whose hit-test policy differs can reuse the ink test without
+ * taking the adapter with it. Two preconditions come with that:
+ *
+ * - `doc` must be hf-id-stamped (what `openComposition` produces). Against an unstamped
+ *   document the default walk matches nothing and every point answers a hard `false`,
+ *   indistinguishable from genuinely empty — pass `addressableOnly: false` there.
+ * - `x`/`y` are the DOCUMENT's own client coordinates, not the host page's. A host with a
+ *   CSS-scaled iframe has to divide out that scale first, or it samples the wrong pixel.
+ *
+ * Note the polarity: this answers "does it paint", the positive question, and cannot say
+ * "not knowable". A caller that wants the fail-safe contract — every uncertainty resolving
+ * toward keeping the composition clickable — wants `PreviewAdapter.isProvablyEmptyAt`.
+ */
+export function compositionPaintsAt(
+  doc: Document,
+  win: Window & typeof globalThis,
+  x: number,
+  y: number,
+  opts?: PaintQueryOptions,
+): boolean {
+  const selector = (opts?.addressableOnly ?? true) ? "[data-hf-id]" : "*";
+  const candidates: PaintCandidate[] = [];
+  doc.querySelectorAll(selector).forEach((el) => {
+    const candidate = paintCandidateAt(el, win, x, y);
+    if (candidate) candidates.push(candidate);
+  });
+
+  // Smallest area first, deeper element first on an exact tie. Compared exactly rather
+  // than within an epsilon: a "close enough" tie relation is intransitive, which makes
+  // Array.sort's output implementation-defined and the smallest-first guarantee (and the
+  // lazy single-sample property that rides on it) engine-dependent.
+  candidates.sort((a, b) => a.area - b.area || b.depth - a.depth);
+
+  let winner: PaintCandidate | undefined;
+  let winnerInk: InkKind = "none";
+  for (const candidate of candidates) {
+    const ink = inkAt(candidate.el, win, { x, y });
+    if (ink === "none") continue;
+    winner = candidate;
+    winnerInk = ink;
+    break;
+  }
+  if (!winner) return false;
+
+  const fullBleed = opts?.fullBleedFraction ?? 0;
+  if (fullBleed <= 0) return true;
+
+  // Never veto a measured pixel. The rule exists to discount paint ASSUMED to fill a box
+  // — a full-frame wrapper with a background-image — and a full-bleed transparent PNG or
+  // SVG overlay is precisely the case where that assumption is wrong: box area is not ink
+  // area, and answering "background" there makes visible artwork unclickable.
+  if (winnerInk === "verified") return true;
+
+  const frameArea = compositionFrameArea(doc, x, y);
+  return frameArea === Infinity || winner.area < fullBleed * frameArea;
 }
 
 // ─── IframePreviewAdapter ─────────────────────────────────────────────────────
@@ -492,6 +809,24 @@ class IframePreviewAdapter implements PreviewAdapter {
   /** Tracked id and element for the in-progress drag. */
   private _draftId: string | null = null;
   private _draftEl: HTMLElement | null = null;
+  /** Accumulated drag deltas from applyDraft calls. */
+  private _draftDx = 0;
+  private _draftDy = 0;
+  /**
+   * The element's effective `translate` when the drag started (inline value,
+   * or computed when no inline one was set; "" = none). Drafts compose onto
+   * this.
+   */
+  private _draftPrevTranslate: string | null = null;
+  /**
+   * The element's raw INLINE `translate` when the drag started ("" = not
+   * inline). Reverts restore exactly this, so a stylesheet-authored translate
+   * is never promoted to a permanent inline style.
+   */
+  private _draftPrevInlineTranslate: string | null = null;
+
+  /** Unsubscribe for the current attachSync subscription, if any. */
+  private _syncDetach: (() => void) | null = null;
 
   constructor(iframe: HTMLIFrameElement, dispatch?: (op: EditOp) => void) {
     this.iframe = iframe;
@@ -543,73 +878,186 @@ class IframePreviewAdapter implements PreviewAdapter {
   }
 
   /**
-   * Write draft CSS custom properties (`--hf-studio-dx`, `--hf-studio-dy`) onto
-   * the target element inside the iframe at 60fps. The composition's CSS uses
-   * these vars to visually translate the element without touching the model.
+   * Is (x, y) provably free of ink? See PreviewAdapter.isProvablyEmptyAt.
    *
-   * Calling applyDraft with a new id replaces the tracked element (does not
-   * cancel the prior draft — call cancelPreview first if switching targets).
+   * Every uncertain path answers false rather than claiming emptiness: an unreachable or
+   * cross-origin document, and a same-origin iframe mid-navigation — srcdoc and blob:
+   * assignment are async navigations, so `contentDocument` is a READABLE but empty
+   * document while the composition is arriving. Walking that would find no ink and hand
+   * back a confident "safe to click through" under a composition about to appear.
+   */
+  isProvablyEmptyAt(x: number, y: number, opts?: PaintQueryOptions): boolean {
+    let doc: Document | null;
+    let win: (Window & typeof globalThis) | null;
+    try {
+      doc = this.iframe.contentDocument;
+      win = this.iframe.contentWindow as (Window & typeof globalThis) | null;
+    } catch {
+      return false; // Cross-origin access throws. Unknowable is not empty.
+    }
+    if (!doc || !win) return false;
+    if (doc.readyState === "loading") return false;
+    if (!doc.querySelector("[data-hf-id]") && !doc.querySelector("[data-composition-id]")) {
+      return false;
+    }
+
+    return !compositionPaintsAt(doc, win, x, y, opts);
+  }
+
+  /**
+   * Visually translate the target element inside the iframe at 60fps without
+   * touching the model: sets the element's `translate` to its pre-drag value
+   * composed with the accumulated delta. `translate` set after GSAP's first
+   * parse is untouched by seeks, so this renders correctly on animated
+   * elements too. (The `--hf-studio-dx/dy` custom properties are no longer
+   * written — compositions with the authored Studio drag-bridge CSS would
+   * move by twice the delta if both channels applied.)
+   *
+   * Calling applyDraft with a new id switches the tracked element, reverting
+   * the previous element's draft translate first.
    *
    * width/height in DraftProps are not yet wired (resize → setStyle, future op).
    */
   applyDraft(id: string, props: DraftProps): void {
-    const doc = this.iframe.contentDocument;
-    if (!doc) return;
+    const el = this._resolveDraftElement(id);
+    if (!el) return;
 
-    // Reuse the tracked element across the 60fps drag; only re-query when the id
-    // changes or the cached node detached (e.g. an iframe reload mid-drag).
+    if (props.dx !== undefined) this._draftDx = props.dx;
+    if (props.dy !== undefined) this._draftDy = props.dy;
+
+    el.style.setProperty(
+      "translate",
+      composeTranslate(this._draftPrevTranslate ?? "", `${this._draftDx}px`, `${this._draftDy}px`),
+    );
+  }
+
+  /**
+   * Resolve and track the drag target. Reuses the tracked element across the
+   * 60fps drag; only re-queries when the id changes or the cached node
+   * detached (e.g. an iframe reload mid-drag). Switching to a different
+   * element reverts the previous one's draft first, then captures the new
+   * element's pre-drag translate.
+   */
+  private _resolveDraftElement(id: string): HTMLElement | null {
+    const doc = this.iframe.contentDocument;
+    if (!doc) return null;
+
     const cached = id === this._draftId && this._draftEl?.isConnected ? this._draftEl : null;
     const el =
       cached ??
       doc.querySelector<HTMLElement>(
         `[data-hf-id="${id.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]`,
       );
-    if (!el) return;
+    if (!el) return null;
 
+    if (el !== this._draftEl) {
+      // Abandoning a prior target mid-drag must not leave it displaced.
+      this._revertDraftTranslate();
+      this._draftDx = 0;
+      this._draftDy = 0;
+      this._draftPrevTranslate = readCurrentTranslate(el);
+      const inline = el.style.getPropertyValue("translate").trim();
+      this._draftPrevInlineTranslate = inline === "none" ? "" : inline;
+    }
     this._draftId = id;
     this._draftEl = el;
-
-    if (props.dx !== undefined) el.style.setProperty(VAR_DX, String(props.dx));
-    if (props.dy !== undefined) el.style.setProperty(VAR_DY, String(props.dy));
+    return el;
   }
 
   /**
    * Read the accumulated draft deltas, derive a moveElement op, dispatch it,
-   * then clear the CSS vars and draft state.
+   * then clear the draft state.
    *
-   * No-ops when:
+   * No-ops (reverting any draft translate) when:
    * - No applyDraft was called (nothing to commit)
    * - No dispatch callback was provided at construction
+   *
+   * If dispatch throws (e.g. the model no longer has the element), the draft
+   * translate is reverted and the error propagates — the element is never
+   * left displaced by an uncommitted draft.
    */
   commitPreview(): void {
     if (!this._draftId || !this._draftEl || !this._dispatch) {
+      this._revertDraftTranslate();
       this._clearDraft();
       return;
     }
 
     const el = this._draftEl;
-    const dx = parseFloat(el.style.getPropertyValue(VAR_DX) || "0") || 0;
-    const dy = parseFloat(el.style.getPropertyValue(VAR_DY) || "0") || 0;
     const dataX = el.getAttribute("data-x");
     const dataY = el.getAttribute("data-y");
-    const { x, y } = computeDraftPosition(dataX, dataY, dx, dy);
+    const { x, y } = computeDraftPosition(dataX, dataY, this._draftDx, this._draftDy);
 
-    this._dispatch({ type: "moveElement", target: this._draftId, x, y });
+    try {
+      this._dispatch({ type: "moveElement", target: this._draftId, x, y });
+    } catch (err) {
+      this._revertDraftTranslate();
+      this._clearDraft();
+      throw err;
+    }
+    this._mirrorCommittedMove(el, dataX, dataY, x, y);
     this._clearDraft();
   }
 
-  /** Revert draft CSS vars without dispatching any op. */
+  /**
+   * Mirror a committed move onto the live element so the position holds
+   * without a document reload — same attributes handleMoveElement writes
+   * into the model, rendered by the runtime's position-edit translate.
+   *
+   * The pre-edit translate is stamped from the value captured at drag start
+   * (the element's current inline translate is the draft-composed one, which
+   * must not be mistaken for the original), then the final translate is
+   * recomputed the same way the runtime does at bind time.
+   */
+  private _mirrorCommittedMove(
+    el: HTMLElement,
+    dataX: string | null,
+    dataY: string | null,
+    x: number,
+    y: number,
+  ): void {
+    if (el.getAttribute(EDIT_BASE_X_ATTR) === null) {
+      el.setAttribute(EDIT_BASE_X_ATTR, dataX ?? "0");
+    }
+    if (el.getAttribute(EDIT_BASE_Y_ATTR) === null) {
+      el.setAttribute(EDIT_BASE_Y_ATTR, dataY ?? "0");
+    }
+    if (el.getAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR) === null) {
+      el.setAttribute(EDIT_ORIGINAL_TRANSLATE_ATTR, this._draftPrevTranslate ?? "");
+    }
+    el.setAttribute("data-x", String(x));
+    el.setAttribute("data-y", String(y));
+    applyPositionEditToElement(el, { force: true });
+  }
+
+  /** Revert the draft translate without dispatching any op. */
   cancelPreview(): void {
+    this._revertDraftTranslate();
     this._clearDraft();
+  }
+
+  /**
+   * Restore the element's pre-drag INLINE `translate` (removing it when there
+   * was none, so a stylesheet-authored translate is never promoted to inline).
+   * NOT called on a successful commit — the committed position-edit translate
+   * is recomputed onto the element by _mirrorCommittedMove.
+   */
+  private _revertDraftTranslate(): void {
+    if (!this._draftEl || this._draftPrevInlineTranslate === null) return;
+    if (this._draftPrevInlineTranslate === "") {
+      this._draftEl.style.removeProperty("translate");
+    } else {
+      this._draftEl.style.setProperty("translate", this._draftPrevInlineTranslate);
+    }
   }
 
   private _clearDraft(): void {
-    if (this._draftEl) {
-      this._draftEl.style.removeProperty(VAR_DX);
-      this._draftEl.style.removeProperty(VAR_DY);
-    }
     this._draftId = null;
     this._draftEl = null;
+    this._draftDx = 0;
+    this._draftDy = 0;
+    this._draftPrevTranslate = null;
+    this._draftPrevInlineTranslate = null;
   }
 
   // Selection -----------------------------------------------------------------
@@ -635,6 +1083,57 @@ class IframePreviewAdapter implements PreviewAdapter {
   private _emit(): void {
     const ids = [...this._selection];
     for (const h of this._handlers) h(ids);
+  }
+
+  /**
+   * Mirror `comp`'s edits onto this.iframe.contentDocument. See the
+   * PreviewAdapter interface doc for the full contract.
+   */
+  attachSync(comp: Composition): () => void {
+    this._syncDetach?.();
+
+    const syncOverrides = (): void => {
+      const doc = this.iframe.contentDocument;
+      if (!doc) return;
+      try {
+        applyOverrideSet({ document: doc, wrapped: false, stamped: "" }, comp.getOverrides());
+      } catch (err) {
+        // Don't let a bad snapshot prevent the ongoing subscription below
+        // from attaching — future patches should still mirror even if this
+        // composition's current overrides couldn't be applied.
+        console.warn("[hyperframes] attachSync: override sync failed:", err);
+      }
+    };
+
+    // Immediate snapshot for the current document…
+    syncOverrides();
+    // …and again on every iframe `load`: assigning srcdoc/src is an ASYNC
+    // navigation, so an attach in the same tick snapshots the OUTGOING
+    // document, and patches committed during the load window mirror into it
+    // and die with it. Re-syncing on load converges the new document with
+    // the composition state regardless of attach/navigation ordering.
+    this.iframe.addEventListener("load", syncOverrides);
+
+    const rawUnsubscribe = comp.on("patch", ({ patches }) => {
+      const liveDoc = this.iframe.contentDocument;
+      if (!liveDoc) return;
+      applyPatchesToDocument(
+        { document: liveDoc, wrapped: false, stamped: "" },
+        // "Never mirror script-tag rewrites" is the documented contract, not
+        // just today's one known path — startsWith so a future script kind
+        // (e.g. "/script/label") is covered by the same intent, not just an
+        // exact string this filter happens to know about today.
+        patches.filter((p) => !p.path.startsWith("/script/")),
+      );
+    });
+
+    const detach = (): void => {
+      this.iframe.removeEventListener("load", syncOverrides);
+      rawUnsubscribe();
+      if (this._syncDetach === detach) this._syncDetach = null;
+    };
+    this._syncDetach = detach;
+    return detach;
   }
 }
 

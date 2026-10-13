@@ -1,19 +1,12 @@
+import { mappedHtmlSource, sourcePosition, type SourceLocation } from "./sourceCoordinates";
 import type { HyperframeLintFinding, HyperframeLinterOptions } from "./types";
-import {
-  extractBlocks,
-  extractOpenTags,
-  findRootTag,
-  collectCompositionIds,
-  readAttr,
-  stripHtmlComments,
-  STYLE_BLOCK_PATTERN,
-  SCRIPT_BLOCK_PATTERN,
-} from "./utils";
+import { parseHtmlStructure, findRootTag, collectCompositionIds, readDecodedAttr } from "./utils";
 import type { OpenTag, ExtractedBlock } from "./utils";
 
 export type { OpenTag, ExtractedBlock };
 
 export type LintContext = {
+  locate: (block: ExtractedBlock, offset: number | undefined) => SourceLocation;
   source: string;
   rawSource: string;
   tags: OpenTag[];
@@ -33,33 +26,60 @@ export function buildLintContext(html: string, options: HyperframeLinterOptions 
   // Strip HTML comments before scanning so a commented-out <template> or tag can't
   // hijack the boundary match below. Linear + fixpoint (see stripHtmlComments) to
   // stay ReDoS-free and catch markers that re-form when a comment is removed.
-  let source = stripHtmlComments(rawSource);
-  const sourceWithoutTemplates = source.replace(
-    /<template\b[^>]*>[\s\S]*?<\/template(?:\s[^>]*)?>/gi,
-    " ",
+  const mapped = mappedHtmlSource(rawSource);
+  let source = mapped.source;
+  let sourceStart = 0;
+  const initialStructure = parseHtmlStructure(source);
+  const templateTags = initialStructure.tags.filter(
+    (tag) => tag.name === "template" && tag.closeIndex != null,
   );
-  const templateMatch = source.match(/<template[^>]*>([\s\S]*)<\/template>/i);
+  let sourceWithoutTemplates = source;
+  for (const template of [...templateTags].reverse()) {
+    const end = template.endIndex ?? template.index;
+    sourceWithoutTemplates =
+      sourceWithoutTemplates.slice(0, template.index) +
+      " ".repeat(end - template.index) +
+      sourceWithoutTemplates.slice(end);
+  }
   // Some sub-composition files are HTML shells whose real root lives inside a
   // <template>. Keep nested templates intact when the visible document already
   // has a composition root; only unwrap when no root exists outside templates.
-  if (templateMatch?.[1] && !findRootTag(sourceWithoutTemplates)) source = templateMatch[1];
+  const template = templateTags[0];
+  let structure = initialStructure;
+  if (template && !findRootTag(sourceWithoutTemplates)) {
+    sourceStart = template.index + template.raw.length;
+    source = source.slice(sourceStart, template.closeIndex);
+    structure = parseHtmlStructure(source);
+  }
 
-  const tags = extractOpenTags(source);
+  const tags = structure.tags;
   const styles = [
-    ...extractBlocks(source, STYLE_BLOCK_PATTERN),
+    ...structure.styles,
     ...(options.externalStyles ?? []).map((style) => ({
       attrs: `href="${style.href}"`,
       content: style.content,
       raw: style.content,
       index: -1,
+      file: style.file ?? style.href,
+      rootRelativePath: style.rootRelativePath,
     })),
   ];
-  const scripts = extractBlocks(source, SCRIPT_BLOCK_PATTERN);
+  const scripts = structure.scripts;
   const compositionIds = collectCompositionIds(tags);
-  const rootTag = findRootTag(source);
-  const rootCompositionId = readAttr(rootTag?.raw || "", "data-composition-id");
+  const rootTag = findRootTag(source, tags);
+  const rootCompositionId = readDecodedAttr(rootTag?.raw || "", "data-composition-id");
 
+  const locate = (block: ExtractedBlock, offset: number | undefined): SourceLocation => {
+    if (offset === undefined || offset < 0 || offset > block.content.length) return {};
+    if (block.index === -1) return sourcePosition(block.content, offset, block.file);
+    if (block.contentStart === undefined) return {};
+    const originalOffset = mapped.originalOffset(sourceStart + block.contentStart + offset);
+    return originalOffset === undefined
+      ? {}
+      : sourcePosition(rawSource, originalOffset, options.filePath);
+  };
   return {
+    locate,
     source,
     rawSource,
     tags,

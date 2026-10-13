@@ -1,62 +1,129 @@
+import { useLivePreviewIframe } from "../../player/store/previewIframeStore";
+import { onPreviewContentReplaced } from "../../player/sceneSwap";
 import { memo, useState, useCallback, useEffect, useRef } from "react";
 import {
   collectDomEditLayerItems,
   getDomEditLayerKey,
+  liveLayerElement,
   resolveDomEditSelection,
   type DomEditLayerItem,
 } from "./domEditing";
-import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
+import {
+  useStudioPlaybackContextOptional,
+  useStudioShellContextOptional,
+  type StudioPlaybackValue,
+  type StudioShellValue,
+} from "../../contexts/StudioContext";
 import { useDomEditContext } from "../../contexts/DomEditContext";
-import { usePlayerStore } from "../../player";
+import { usePlayerStore, liveTime } from "../../player";
 import {
   findMatchingTimelineElementId,
   resolveTimelineSelectionSeekTime,
 } from "../../utils/studioHelpers";
-import { Layers } from "../../icons/SystemIcons";
+import {
+  Film,
+  Folder,
+  ImageIcon,
+  Layers,
+  Music,
+  Square,
+  Type,
+  Vector,
+} from "../../icons/SystemIcons";
+import { isCompositionHost, layerKindOf } from "./layerKind";
 import { useLayerDrag, isLayerDraggable, type LayerReorderEvent } from "./useLayerDrag";
+import { getVisibleLayers, sortLayersByZIndex } from "./layersPanelSort";
+import { deriveTimelineStoreKey } from "../../player/lib/timelineElementHelpers";
+import { resolveZOrderReposition } from "./canvasContextMenuZOrder";
+import { buildStableSelector } from "./domEditingDom";
+import { zReorderCoalesceKey } from "../../hooks/useElementLifecycleOps";
+import { useLayerReorderTimelineMirror } from "../nle/useCanvasZOrderTimelineMirror";
+import { runZLaneGesture } from "../nle/zLaneGesture";
+import { useLayerRevealOverride } from "./useLayerRevealOverride";
 
-const TAG_ICONS: Record<string, string> = {
-  video: "Vi",
-  audio: "Au",
-  img: "Im",
-  svg: "Sv",
-  canvas: "Cn",
-  div: "Di",
-  section: "Se",
-  span: "Sp",
-  p: "P",
-  h1: "H1",
-  h2: "H2",
-  h3: "H3",
-  h4: "H4",
-  h5: "H5",
-  h6: "H6",
-  a: "A",
-  button: "Bt",
-  ul: "Ul",
-  ol: "Ol",
-  li: "Li",
-  style: "St",
-  template: "Te",
-};
+// Rows this panel renders before it stops. A display budget, not a document limit.
+const LAYERS_PANEL_MAX_ROWS = 80;
 
-function getTagBadge(tagName: string): string {
-  return TAG_ICONS[tagName] ?? tagName.slice(0, 2).toUpperCase();
-}
+const [CARET, ICON, GAP] = [16, 20, 6];
+const CHILD_INDENT = CARET + GAP + ICON + GAP;
 
-function isCompositionHost(el: HTMLElement): boolean {
-  return el.hasAttribute("data-composition-src") || el.hasAttribute("data-composition-file");
+const KIND_ICON = {
+  image: ImageIcon,
+  video: Film,
+  audio: Music,
+  vector: Vector,
+  group: Folder,
+  text: Type,
+  shape: Square,
+} as const;
+
+/**
+ * A trailing-rAF + cooldown throttle: `invoke` runs `run` at most once per
+ * animation frame and no more often than `throttleMs`. `cancel` clears any
+ * pending frame (call on cleanup). Extracted so the throttle can be exercised
+ * directly in tests instead of being reconstructed there.
+ */
+export function createRafThrottle(
+  run: () => void,
+  throttleMs = 100,
+): { invoke: () => void; cancel: () => void } {
+  let rafId: number | null = null;
+  let lastFired = 0;
+  return {
+    invoke: () => {
+      const now = performance.now();
+      if (rafId !== null || now - lastFired < throttleMs) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        lastFired = performance.now();
+        run();
+      });
+    },
+    cancel: () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    },
+  };
 }
 
 interface CollapsedState {
   [key: string]: boolean;
 }
 
+/** Studio state the panel reads; passed by hosts outside Studio's providers. Keep previewIframeRef stable;
+ * a host with its own player calls announcePreviewDocumentLoaded on each new page, or bumps refreshKey. */
+export type LayersPanelHost = Pick<
+  StudioShellValue,
+  "previewIframeRef" | "activeCompPath" | "showToast"
+> &
+  Pick<StudioPlaybackValue, "timelineElements" | "isPlaying"> &
+  Partial<Pick<StudioPlaybackValue, "refreshKey" | "compositionLoading">>;
+
+function useLayersPanelHost(host: LayersPanelHost | undefined): LayersPanelHost {
+  const shell = useStudioShellContextOptional();
+  const playback = useStudioPlaybackContextOptional();
+  if (host) return host;
+  if (!shell || !playback) {
+    throw new Error("LayersPanel needs a host prop outside Studio's shell and playback providers");
+  }
+  return { ...shell, ...playback };
+}
+
 // fallow-ignore-next-line complexity
-export const LayersPanel = memo(function LayersPanel() {
-  const { previewIframeRef, activeCompPath, showToast } = useStudioShellContext();
-  const { refreshKey, compositionLoading, timelineElements } = useStudioPlaybackContext();
+export const LayersPanel = memo(function LayersPanel({ host }: { host?: LayersPanelHost }) {
+  const {
+    previewIframeRef,
+    activeCompPath,
+    showToast,
+    refreshKey,
+    compositionLoading,
+    timelineElements,
+    isPlaying,
+  } = useLayersPanelHost(host);
   const currentTime = usePlayerStore((s) => s.currentTime);
+  // Flashless z commits (canvas menu, timeline lane-drag z-sync) mutate iframe
+  // z-indexes with no reload and no refreshKey bump — while paused, nothing
+  // else re-collects, so the panel's z-sorted order would go stale.
+  const zEditVersion = usePlayerStore((s) => s.zEditVersion);
   const {
     domEditSelection,
     activeGroupElement,
@@ -70,9 +137,15 @@ export const LayersPanel = memo(function LayersPanel() {
   const [collapsed, setCollapsed] = useState<CollapsedState>({});
   const prevDocVersionRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const mirrorLayerReorderToTimeline = useLayerReorderTimelineMirror();
+  const { scheduleReveal } = useLayerRevealOverride({
+    isPlaying,
+    selectedElement: domEditSelection?.element ?? null,
+  });
 
   const isMasterView = !activeCompPath || activeCompPath === "index.html";
 
+  const livePreviewIframe = useLivePreviewIframe();
   const collectLayers = useCallback(() => {
     const iframe = previewIframeRef.current;
     if (!iframe) return;
@@ -91,17 +164,19 @@ export const LayersPanel = memo(function LayersPanel() {
     // A preview reload detaches the drilled-into wrapper; exit drill-in if so.
     if (activeGroupElement && !activeGroupElement.isConnected) setActiveGroupElement(null);
 
-    const items = collectDomEditLayerItems(root, {
-      activeCompositionPath: activeCompPath,
-      isMasterView,
-      activeGroupElement,
-    });
+    const items = collectDomEditLayerItems(
+      root,
+      { activeCompositionPath: activeCompPath, isMasterView, activeGroupElement },
+      // How many rows this panel is willing to render, nothing more. Hit-testing
+      // callers deliberately take the whole document instead.
+      LAYERS_PANEL_MAX_ROWS,
+    );
     setLayers(sortLayersByZIndex(items));
   }, [previewIframeRef, activeCompPath, isMasterView, activeGroupElement, setActiveGroupElement]);
 
   useEffect(() => {
     collectLayers();
-  }, [collectLayers, refreshKey]);
+  }, [collectLayers, refreshKey, zEditVersion, livePreviewIframe]);
 
   useEffect(() => {
     const iframe = previewIframeRef.current;
@@ -110,9 +185,8 @@ export const LayersPanel = memo(function LayersPanel() {
       prevDocVersionRef.current += 1;
       collectLayers();
     };
-    iframe.addEventListener("load", handleLoad);
-    return () => iframe.removeEventListener("load", handleLoad);
-  }, [previewIframeRef, collectLayers]);
+    return onPreviewContentReplaced(iframe, handleLoad);
+  }, [previewIframeRef, livePreviewIframe, collectLayers]);
 
   useEffect(() => {
     if (!compositionLoading) {
@@ -121,22 +195,24 @@ export const LayersPanel = memo(function LayersPanel() {
     }
   }, [compositionLoading, collectLayers]);
 
+  // Subscribe to liveTime so the panel refreshes during scrubbing.
+  // liveTime bypasses React state (no re-renders per frame), so a plain
+  // usePlayerStore(s => s.currentTime) subscription never fires while the
+  // RAF loop is running.  Throttle with a trailing rAF + 100 ms cooldown to
+  // avoid a collectLayers call on every animation frame.
+  useEffect(() => {
+    const throttle = createRafThrottle(collectLayers, 100);
+    const unsubscribe = liveTime.subscribe(throttle.invoke);
+    return () => {
+      unsubscribe();
+      throttle.cancel();
+    };
+  }, [collectLayers]);
+
   const resolveSelection = useCallback(
     (layer: DomEditLayerItem) => {
-      // Re-find the element from the live DOM — layer.element may be stale
-      // after soft reload (which replaces scripts without reloading the iframe).
-      let el = layer.element;
-      if (!el.isConnected) {
-        const iframe = previewIframeRef.current;
-        const doc = iframe?.contentDocument;
-        if (doc) {
-          const found =
-            (layer.id ? doc.getElementById(layer.id) : null) ??
-            (layer.hfId ? doc.querySelector(`[data-hf-id="${CSS.escape(layer.hfId)}"]`) : null) ??
-            doc.getElementById(layer.key);
-          if (found instanceof HTMLElement) el = found;
-        }
-      }
+      const doc = previewIframeRef.current?.contentDocument;
+      const el = liveLayerElement(layer, doc, activeCompPath);
       return resolveDomEditSelection(el, {
         activeCompositionPath: activeCompPath,
         isMasterView,
@@ -186,8 +262,13 @@ export const LayersPanel = memo(function LayersPanel() {
       if (!selection) return;
       applyDomSelection(selection);
       await seekToLayer(layer);
+      // Force-reveal AFTER the seek's runtime visibility sync has had a beat:
+      // a clip made active by the seek shows naturally and needs no override,
+      // so the reveal only touches nodes that REMAIN hidden (animation-parked
+      // opacity, non-clip display/visibility hides, hidden ancestors).
+      scheduleReveal(selection.element, 150);
     },
-    [resolveSelection, applyDomSelection, seekToLayer],
+    [resolveSelection, applyDomSelection, seekToLayer, scheduleReveal],
   );
 
   // Double-click a group row → drill into it; any other row → select it.
@@ -220,6 +301,7 @@ export const LayersPanel = memo(function LayersPanel() {
     setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
+  // fallow-ignore-next-line complexity
   const handleReorder = useCallback(
     (event: LayerReorderEvent) => {
       const { siblingLayers, fromIndex, toIndex } = event;
@@ -227,23 +309,88 @@ export const LayersPanel = memo(function LayersPanel() {
       const [moved] = reordered.splice(fromIndex, 1);
       reordered.splice(toIndex, 0, moved);
 
-      const existingValues = siblingLayers.map((l) => getElementZIndex(l.element));
-      const sorted = [...existingValues].sort((a, b) => b - a);
-      const hasDupes = sorted.some((v, i) => i > 0 && v === sorted[i - 1]);
-      const zValues = hasDupes ? reordered.map((_, i) => reordered.length - i) : sorted;
+      // Panel order is top-first (sortLayersByZIndex: z desc, later-DOM-first),
+      // so the desired RENDER order (bottom→top) is the reverse. The minimal
+      // resolver (shared with the canvas z-menu) then writes one between-z
+      // value when a strict gap exists, band-safe renumber otherwise — instead
+      // of the old computeReorderZValues stamp of every sibling.
+      const desiredBottomToTop = [...reordered].reverse();
+      const patches = resolveZOrderReposition(
+        moved.element,
+        desiredBottomToTop.map((l) => l.element),
+      );
+      if (!patches || patches.length === 0) return; // paint order unchanged
 
-      const entries = reordered.map((layer, i) => ({
-        element: layer.element,
-        zIndex: zValues[i],
-        id: layer.id,
-        selector: layer.selector,
-        selectorIndex: layer.selectorIndex,
-        sourceFile: layer.sourceFile,
-      }));
+      const layerByElement = new Map(siblingLayers.map((l) => [l.element, l]));
+      const entries: Array<{
+        element: HTMLElement;
+        zIndex: number;
+        id?: string;
+        selector?: string;
+        selectorIndex?: number;
+        sourceFile: string;
+        key?: string;
+      }> = [];
+      for (const patch of patches) {
+        // The renumber fallback can patch a painting sibling the panel didn't
+        // list (non-collected family member): derive its identity from the DOM
+        // node, exactly like the canvas menu's siblingZIndexEntry. Un-targetable
+        // nodes get a live-only style write (reverts on reload).
+        const layer = layerByElement.get(patch.element);
+        const id = layer?.id ?? (patch.element.id || undefined);
+        const selector = layer?.selector ?? buildStableSelector(patch.element);
+        if (!id && !selector) {
+          patch.element.style.zIndex = String(patch.zIndex);
+          continue;
+        }
+        const sourceFile = layer?.sourceFile ?? moved.sourceFile;
+        entries.push({
+          element: patch.element,
+          zIndex: patch.zIndex,
+          id,
+          selector,
+          selectorIndex: layer?.selectorIndex,
+          sourceFile,
+          key: deriveTimelineStoreKey({
+            domId: id,
+            selector,
+            selectorIndex: layer?.selectorIndex,
+            sourceFile,
+          }),
+        });
+      }
+      if (entries.length === 0) return;
 
-      handleDomZIndexReorderCommit(entries);
+      // ONE undo entry for the whole gesture: the z persist and the timeline
+      // lane mirror below share this per-gesture-unique key (same contract as
+      // the canvas menu's wiring in ConnectedDomEditOverlay).
+      const coalesceKey = zReorderCoalesceKey(entries, "layer-drag");
+      const desiredOrderKeys = desiredBottomToTop.map(
+        (l) =>
+          deriveTimelineStoreKey({
+            domId: l.id,
+            selector: l.selector,
+            selectorIndex: l.selectorIndex,
+            sourceFile: l.sourceFile,
+          }) ?? null,
+      );
+      const movedKey = deriveTimelineStoreKey({
+        domId: moved.id,
+        selector: moved.selector,
+        selectorIndex: moved.selectorIndex,
+        sourceFile: moved.sourceFile,
+      });
+      // One serialized z→lane transaction (shared queue with the canvas
+      // z-order menu): the mirror runs only after a DURABLE z persist, and
+      // rapid successive gestures cannot interleave phases — see
+      // runZLaneGesture.
+      runZLaneGesture({
+        commitZ: () => handleDomZIndexReorderCommit(entries, coalesceKey, "layer-drag"),
+        mirror: () =>
+          mirrorLayerReorderToTimeline({ selectionKey: movedKey, desiredOrderKeys, coalesceKey }),
+      }).catch(() => undefined);
     },
-    [handleDomZIndexReorderCommit],
+    [handleDomZIndexReorderCommit, mirrorLayerReorderToTimeline],
   );
 
   const selectedKey = domEditSelection ? getDomEditLayerKey(domEditSelection) : null;
@@ -286,7 +433,7 @@ export const LayersPanel = memo(function LayersPanel() {
       </div>
       <div
         ref={scrollContainerRef}
-        className="relative min-h-0 flex-1 overflow-y-auto py-1"
+        className="relative min-h-0 flex-1 select-none overflow-y-auto py-1"
         onPointerMove={handleContainerPointerMove}
         onPointerUp={handleContainerPointerUp}
         onPointerCancel={handleContainerPointerUp}
@@ -295,7 +442,7 @@ export const LayersPanel = memo(function LayersPanel() {
           <button
             type="button"
             onClick={() => setActiveGroupElement(null)}
-            className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] text-panel-text-3 hover:bg-panel-hover/40 hover:text-panel-text-1"
+            className="mx-1 flex w-[calc(100%-0.5rem)] items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-panel-text-3 hover:bg-panel-hover/40 hover:text-panel-text-1"
           >
             <span aria-hidden="true">←</span>
             <span className="truncate">
@@ -310,6 +457,14 @@ export const LayersPanel = memo(function LayersPanel() {
           const isCollapsed = collapsed[layer.key] ?? false;
           const hasChildren = layer.childCount > 0;
           const isCompHost = isCompositionHost(layer.element);
+          const kind = layerKindOf(layer.element, hasChildren);
+          const KindIcon = KIND_ICON[kind];
+          const kindName = kind[0].toUpperCase() + kind.slice(1);
+          const hint = draggable
+            ? layer.element.hasAttribute("data-hf-group")
+              ? "Double-click to enter group"
+              : undefined
+            : "This layer can't be reordered";
 
           return (
             <div
@@ -327,20 +482,23 @@ export const LayersPanel = memo(function LayersPanel() {
                   handleSelectLayer(layer);
                 }
               }}
-              className={`group flex w-full items-center gap-1.5 px-2 py-1 text-left transition-colors ${
+              className={`group mx-1 flex items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors ${
                 isDragged
                   ? "opacity-40"
                   : selected
-                    ? "bg-panel-accent/14 text-panel-accent"
+                    ? "bg-panel-accent/14 text-accent-ink"
                     : "text-panel-text-2 hover:bg-panel-hover/40 hover:text-panel-text-1"
-              } ${dragKey ? "cursor-grabbing" : draggable ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}
-              style={{ paddingLeft: 8 + layer.depth * 16 }}
+              } ${dragKey ? "cursor-grabbing" : "cursor-pointer"}`}
+              style={{ paddingLeft: 8 + layer.depth * CHILD_INDENT }}
+              title={hint}
             >
               {hasChildren ? (
                 <button
                   type="button"
                   onClick={(e) => toggleCollapse(layer.key, e)}
-                  className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded text-neutral-500 hover:text-neutral-300"
+                  aria-expanded={!isCollapsed}
+                  aria-label={isCollapsed ? "Expand children" : "Collapse children"}
+                  className="relative flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-neutral-500 hover:text-neutral-300 before:absolute before:-inset-1.5 before:content-['']"
                 >
                   <svg
                     width="8"
@@ -352,19 +510,19 @@ export const LayersPanel = memo(function LayersPanel() {
                     <path d="M2 1l4 3-4 3z" />
                   </svg>
                 </button>
-              ) : (
-                <span className="w-4 flex-shrink-0" />
-              )}
+              ) : null}
               <span
-                className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-[8px] font-bold uppercase ${
+                data-layer-kind={kind}
+                title={hint ? `${kindName} · ${hint}` : kindName}
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded ${
                   selected
-                    ? "bg-panel-accent/18 text-panel-accent"
+                    ? "bg-panel-accent/18 text-accent-ink"
                     : isCompHost
-                      ? "bg-panel-accent/40 text-panel-accent"
+                      ? "bg-on text-accent-ink"
                       : "bg-panel-hover text-panel-text-4"
                 }`}
               >
-                {getTagBadge(layer.tagName)}
+                <KindIcon size={12} />
               </span>
               <span className="min-w-0 flex-1 truncate text-[11px]">{layer.label}</span>
               {hasChildren && (
@@ -386,95 +544,6 @@ export const LayersPanel = memo(function LayersPanel() {
   );
 });
 
-// ── Pure helpers ──────────────────────────────────────────────────────
-
-// fallow-ignore-next-line complexity
-function getElementZIndex(element: HTMLElement): number {
-  try {
-    const inline = element.style?.zIndex;
-    if (inline && inline !== "auto") {
-      const parsed = parseInt(inline, 10);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    const win = element.ownerDocument?.defaultView;
-    if (!win) return 0;
-    const value = win.getComputedStyle(element).zIndex;
-    if (value === "auto" || value === "") return 0;
-    const parsed = parseInt(value, 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  } catch {
-    return 0;
-  }
-}
-
-// fallow-ignore-next-line complexity
-export function sortLayersByZIndex(layers: DomEditLayerItem[]): DomEditLayerItem[] {
-  if (layers.length <= 1) return layers;
-
-  const minDepth = layers[0].depth;
-  for (let i = 1; i < layers.length; i++) {
-    if (layers[i].depth < minDepth) return layers;
-  }
-
-  const chunks: Array<{ root: DomEditLayerItem; children: DomEditLayerItem[]; domIndex: number }> =
-    [];
-
-  for (let i = 0; i < layers.length; i++) {
-    if (layers[i].depth === minDepth) {
-      const children: DomEditLayerItem[] = [];
-      let j = i + 1;
-      while (j < layers.length && layers[j].depth > minDepth) {
-        children.push(layers[j]);
-        j++;
-      }
-      chunks.push({ root: layers[i], children, domIndex: chunks.length });
-    }
-  }
-
-  if (chunks.length <= 1) {
-    if (chunks.length === 1 && chunks[0].children.length > 0) {
-      const sorted = sortLayersByZIndex(chunks[0].children);
-      return [chunks[0].root, ...sorted];
-    }
-    return layers;
-  }
-
-  chunks.sort((a, b) => {
-    const zA = getElementZIndex(a.root.element);
-    const zB = getElementZIndex(b.root.element);
-    if (zA !== zB) return zB - zA;
-    return b.domIndex - a.domIndex;
-  });
-
-  const result: DomEditLayerItem[] = [];
-  for (const chunk of chunks) {
-    result.push(chunk.root);
-    if (chunk.children.length > 0) {
-      result.push(...sortLayersByZIndex(chunk.children));
-    }
-  }
-  return result;
-}
-
-function getVisibleLayers(
-  layers: DomEditLayerItem[],
-  collapsed: CollapsedState,
-): DomEditLayerItem[] {
-  if (Object.keys(collapsed).length === 0) return layers;
-
-  const result: DomEditLayerItem[] = [];
-  let skipDepth = -1;
-
-  for (const layer of layers) {
-    if (skipDepth >= 0 && layer.depth > skipDepth) continue;
-    skipDepth = -1;
-
-    result.push(layer);
-
-    if (collapsed[layer.key] && layer.childCount > 0) {
-      skipDepth = layer.depth;
-    }
-  }
-
-  return result;
-}
+// The sort helper lives in layersPanelSort.ts (600-line studio cap);
+// re-exported so existing imports from "./LayersPanel" still resolve.
+export { sortLayersByZIndex } from "./layersPanelSort";

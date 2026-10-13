@@ -12,8 +12,7 @@ import {
 } from "./playback-state.js";
 import type { ShaderLoaderState } from "./shader-loader-state.js";
 import type { ShaderTransitionState } from "./shader-options.js";
-
-const FPS = 30;
+import { inspectRuntimeProtocol } from "@hyperframes/core/runtime/protocol";
 
 type SceneRecord = { id: string; start: number; duration: number };
 
@@ -41,10 +40,16 @@ export interface MessageHandlerCallbacks extends PlaybackStateCallbacks {
    *  uses it to replay current bridge state (mute, volume, playback rate) so
    *  control messages sent before the iframe's listener registered aren't lost. */
   onRuntimeReady: () => void;
+  /** Invoked when the runtime reports its composition assets settled. */
+  onRuntimeAssetsReady?: (timedOut: boolean) => void;
+  onRuntimeDataApplied?: (channel: unknown, requestId: unknown) => void;
+  onRuntimeDataError?: (channel: unknown, requestId: unknown, message: unknown) => void;
   /** Invoked when the runtime posts a finite positive timeline duration. The
    *  player uses this as the cross-origin readiness signal because the
    *  same-origin composition probe cannot inspect CDN iframes. */
-  onRuntimeTimelineReady: (duration: number) => void;
+  onRuntimeTimelineReady: (duration: number, assetsReady: boolean | undefined) => void;
+  setRuntimeFps?: (fps: number) => void;
+  setRuntimeOwnsPlayRange?: (owns: boolean) => void;
   /** Called with the scene list whenever a "timeline" message is received. */
   setScenes: (scenes: SceneRecord[]) => void;
   /** Return false to ignore the iframe runtime's audible-media autoplay fallback.
@@ -62,6 +67,19 @@ export function handleRuntimeMessage(
   if (event.source !== frameWindow) return;
   const data = event.data as Record<string, unknown> | undefined;
   if (!data || data["source"] !== "hf-preview") return;
+  const protocol = inspectRuntimeProtocol(data);
+  if (protocol.status === "unsupported") {
+    callbacks.dispatchEvent(
+      new CustomEvent("runtimeprotocolerror", {
+        detail: { code: protocol.code, receivedVersion: protocol.receivedVersion },
+      }),
+    );
+    return;
+  }
+  callbacks.setRuntimeFps?.(protocol.fps);
+  const ownsPlayRange =
+    protocol.status === "supported" && protocol.metadata.capabilities.includes("play-range");
+  callbacks.setRuntimeOwnsPlayRange?.(ownsPlayRange);
 
   if (data["type"] === "shader-transition-state") {
     const state: ShaderTransitionState =
@@ -82,11 +100,32 @@ export function handleRuntimeMessage(
     return;
   }
 
+  if (data["type"] === "assets-ready") {
+    callbacks.onRuntimeAssetsReady?.(data["timedOut"] === true);
+    return;
+  }
+
+  if (data["type"] === "runtime-data-error") {
+    callbacks.onRuntimeDataError?.(data["channel"], data["requestId"], data["message"]);
+    return;
+  }
+
+  if (data["type"] === "runtime-data-applied") {
+    callbacks.onRuntimeDataApplied?.(data["channel"], data["requestId"]);
+    return;
+  }
+
   if (data["type"] === "state") {
     callbacks.setPlaybackState(
       applyRuntimeStateMessage(
-        { frame: (data["frame"] as number) ?? 0, isPlaying: !!data["isPlaying"] },
-        FPS,
+        {
+          frame: (data["frame"] as number) ?? 0,
+          currentTime: data["currentTime"] as number | undefined,
+          ended: typeof data["ended"] === "boolean" ? data["ended"] : undefined,
+          isPlaying: !!data["isPlaying"],
+          ownsRange: ownsPlayRange,
+        },
+        protocol.fps,
         callbacks.getPlaybackState(),
         callbacks,
       ),
@@ -110,12 +149,31 @@ export function handleRuntimeMessage(
   }
 
   if (data["type"] === "timeline" && (data["durationInFrames"] as number) > 0) {
-    if (Number.isFinite(data["durationInFrames"])) {
+    const declaredDuration = Number(data["durationSeconds"]);
+    const frameDuration = Number(data["durationInFrames"]);
+    const duration =
+      Number.isFinite(declaredDuration) && declaredDuration > 0
+        ? declaredDuration
+        : frameDuration / protocol.fps;
+    if (
+      Number.isFinite(data["compositionWidth"]) &&
+      (data["compositionWidth"] as number) > 0 &&
+      Number.isFinite(data["compositionHeight"]) &&
+      (data["compositionHeight"] as number) > 0
+    ) {
+      callbacks.setCompositionSize(
+        data["compositionWidth"] as number,
+        data["compositionHeight"] as number,
+      );
+    }
+    if (Number.isFinite(duration) && duration > 0) {
       const pb = callbacks.getPlaybackState();
-      const duration = (data["durationInFrames"] as number) / FPS;
       callbacks.setPlaybackState({ ...pb, duration });
       callbacks.updateControlsTime(pb.currentTime, duration);
-      callbacks.onRuntimeTimelineReady(duration);
+      callbacks.onRuntimeTimelineReady(
+        duration,
+        typeof data["assetsReady"] === "boolean" ? data["assetsReady"] : undefined,
+      );
     }
     callbacks.setScenes(extractScenes(data["scenes"]));
     return;

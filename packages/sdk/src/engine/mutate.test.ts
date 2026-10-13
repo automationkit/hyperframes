@@ -31,6 +31,13 @@ function fresh() {
   return parseMutable(BASE_HTML);
 }
 
+// Full document (BASE_HTML wrapped in <html>) with NO declarations — the shape
+// declareVariable requires (it refuses fragment sources whose synthetic <html>
+// is stripped on serialize).
+function freshDoc() {
+  return parseMutable(`<!DOCTYPE html><html><body>${BASE_HTML}</body></html>`);
+}
+
 /** Full HTML fixture with data-composition-variables for B1/B2 tests. */
 const VARIABLES_HTML = `<!DOCTYPE html>
 <html data-composition-id="c1" data-composition-duration="5" data-composition-variables='${JSON.stringify(
@@ -255,11 +262,170 @@ describe("setText", () => {
   it("override-set key maps correctly", () => {
     expect(pathToKey("/elements/hf-title/text")).toBe("hf-title.text");
   });
+
+  // A `<br>` line break is a void element, not the element's text target. It
+  // must not make the heading read as empty (→ non-editable) nor be corrupted
+  // by setText. See getOwnText / setOwnText in model.ts.
+  describe("<br> line-break leaves", () => {
+    const brDoc = () =>
+      parseMutable(
+        '<div data-hf-id="hf-s" data-hf-root><h1 data-hf-id="hf-br">Centrifugal<br>Force</h1></div>',
+      );
+
+    it("reads a <br>-split heading as editable text (newline-joined), not empty", () => {
+      const parsed = brDoc();
+      // The inverse patch value is the pre-edit text — proves getOwnText read
+      // the heading as "Centrifugal\nForce" rather than "" (which surfaced as
+      // `text: null` → "not editable" in the studio panel).
+      const { inverse } = applyOp(parsed, { type: "setText", target: "hf-br", value: "x" });
+      expect(inverse[0]).toMatchObject({ value: "Centrifugal\nForce" });
+    });
+
+    it("preserves the <br> when setting text (no </br> corruption)", () => {
+      const parsed = brDoc();
+      applyOp(parsed, { type: "setText", target: "hf-br", value: "Centripetal\nForce" });
+      const html = serializeDocument(parsed);
+      expect(html).toContain("Centripetal");
+      expect(html).toContain("Force");
+      expect(html).toContain("<br");
+      // The <br> must stay empty — never gains a text child.
+      const br = parsed.document.querySelector('[data-hf-id="hf-br"] br');
+      expect(br?.textContent).toBe("");
+    });
+
+    it("drops the line break when the new text has no newline", () => {
+      const parsed = brDoc();
+      applyOp(parsed, { type: "setText", target: "hf-br", value: "Centrifugal Force" });
+      const h1 = parsed.document.querySelector('[data-hf-id="hf-br"]');
+      expect(h1?.querySelector("br")).toBeNull();
+      expect(h1?.textContent).toBe("Centrifugal Force");
+    });
+
+    it("reuses the existing <br> node so an in-place edit round-trips exactly", () => {
+      const parsed = parseMutable(
+        '<div data-hf-id="hf-s" data-hf-root><h1 data-hf-id="hf-br">Centrifugal<br data-hf-id="hf-x5px">Force</h1></div>',
+      );
+      const before = serializeDocument(parsed);
+      // Same line count → the <br> (and its data-hf-id) is preserved, and undo
+      // is byte-exact.
+      const { inverse } = applyOp(parsed, {
+        type: "setText",
+        target: "hf-br",
+        value: "Angular\nMomentum",
+      });
+      expect(serializeDocument(parsed)).toContain('<br data-hf-id="hf-x5px">');
+      applyPatchesToDocument(parsed, inverse);
+      expect(serializeDocument(parsed)).toBe(before);
+    });
+  });
 });
 
 // ─── setAttribute ─────────────────────────────────────────────────────────────
 
 describe("setAttribute", () => {
+  it("keeps an authored media id", () => {
+    const parsed = parseMutable(
+      '<video data-hf-id="hf-media" id="hero-shot" src="harbor.mp4"></video>',
+    );
+    applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "library.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("hero-shot");
+  });
+
+  it("re-mints a generated media id across two replacements and restores it on undo", () => {
+    const parsed = parseMutable(
+      '<video data-hf-id="hf-media" id="harbor_2" src="harbor.mp4"></video><img id="library" src="other.png">',
+    );
+    const before = serializeDocument(parsed);
+    const first = applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "library.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("library_2");
+    const second = applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "sunset.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("sunset");
+    applyPatchesToDocument(parsed, second.inverse);
+    applyPatchesToDocument(parsed, first.inverse);
+    expect(serializeDocument(parsed)).toBe(before);
+  });
+
+  it.each(["data-timeline-label", "data-label", "aria-label"])(
+    "keeps an explicitly labeled generated id: %s",
+    (name) => {
+      const parsed = parseMutable(
+        `<video data-hf-id="hf-media" id="harbor" src="harbor.mp4" ${name}="Opening Shot"></video>`,
+      );
+      applyOp(parsed, {
+        type: "setAttribute",
+        target: "hf-media",
+        name: "src",
+        value: "library.mp4",
+      });
+      expect(parsed.document.querySelector("video")?.id).toBe("harbor");
+      expect(parsed.document.querySelector("video")?.getAttribute(name)).toBe("Opening Shot");
+    },
+  );
+
+  it("does not treat another clip source as an id reference", () => {
+    const parsed = parseMutable(
+      '<video data-hf-id="hf-media" id="harbor" src="harbor.mp4"></video><video data-hf-id="hf-other" id="harbor_2" src="harbor.mp4"></video>',
+    );
+    applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "library.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("library");
+  });
+
+  it("allows replacement with unrelated invalid escapes in authored code", () => {
+    const parsed = parseMutable(
+      String.raw`<video data-hf-id="hf-media" id="harbor" src="harbor.mp4"></video><style>.other { content: "\ffffff" }</style><script>const unrelated = "\u{110000}";</script>`,
+    );
+    applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "library.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("library");
+  });
+
+  it.each([
+    '<script>gsap.to("#harbor", {x: 10})</script>',
+    "<style>#harbor {opacity: .5}</style>",
+    '<img src="asset.svg#harbor">',
+    '<img src="asset.svg#%68arbor">',
+    '<img src="#harbor">',
+    String.raw`<style>#\68 arbor {opacity: .5}</style>`,
+    String.raw`<script>document.getElementById("\x68arbor")</script>`,
+    '<div aria-labelledby="harbor"></div>',
+    '<template><div data-start="harbor + 2"></div></template>',
+  ])("keeps a referenced generated id: %s", (reference) => {
+    const parsed = parseMutable(
+      '<video data-hf-id="hf-media" id="harbor" src="harbor.mp4"></video>' + reference,
+    );
+    applyOp(parsed, {
+      type: "setAttribute",
+      target: "hf-media",
+      name: "src",
+      value: "library.mp4",
+    });
+    expect(parsed.document.querySelector("video")?.id).toBe("harbor");
+  });
+
   it("sets a new attribute and emits add patch", () => {
     const parsed = fresh();
     const result = applyOp(parsed, {
@@ -314,7 +480,8 @@ describe("setTiming", () => {
     const el = parsed.document.querySelector('[data-hf-id="hf-title"]');
     expect(el?.getAttribute("data-start")).toBe("1");
     // duration was 3 (0→3), so end = 1+3 = 4
-    expect(el?.getAttribute("data-end")).toBe("4");
+    expect(el?.getAttribute("data-duration")).toBe("3");
+    expect(el?.getAttribute("data-end")).toBeNull();
     const startPatch = result.forward.find((p) => p.path.endsWith("/start"));
     expect(startPatch?.value).toBe(1);
   });
@@ -323,12 +490,12 @@ describe("setTiming", () => {
     const parsed = fresh();
     applyOp(parsed, { type: "setTiming", target: "hf-title", duration: 2 });
     const el = parsed.document.querySelector('[data-hf-id="hf-title"]');
-    expect(el?.getAttribute("data-end")).toBe("2"); // start=0, duration=2 → end=2
+    expect(el?.getAttribute("data-duration")).toBe("2");
+    expect(el?.getAttribute("data-end")).toBeNull();
   });
 
   it("inverse patches restore original timing", () => {
     const parsed = fresh();
-    const before = serializeDocument(parsed);
     const { inverse } = applyOp(parsed, {
       type: "setTiming",
       target: "hf-title",
@@ -337,7 +504,11 @@ describe("setTiming", () => {
       trackIndex: 1,
     });
     applyPatchesToDocument(parsed, inverse);
-    expect(serializeDocument(parsed)).toBe(before);
+    const restored = parsed.document.querySelector('[data-hf-id="hf-title"]');
+    expect(restored?.getAttribute("data-start")).toBe("0");
+    expect(restored?.getAttribute("data-duration")).toBeNull();
+    expect(restored?.getAttribute("data-end")).toBe("3");
+    expect(restored?.getAttribute("data-track-index")).toBe("0");
   });
 });
 
@@ -743,6 +914,52 @@ describe("setElementStyles key normalization", () => {
   });
 });
 
+describe("setElementStyles unquoted CSS escapes", () => {
+  it.each([
+    [
+      "semicolon",
+      String.raw`--label: alpha\;beta; width: 120px; color: red`,
+      String.raw`alpha\;beta`,
+    ],
+    [
+      "opening parenthesis",
+      String.raw`--label: alpha\(beta; width: 120px; color: red`,
+      String.raw`alpha\(beta`,
+    ],
+    [
+      "double quote",
+      String.raw`--label: alpha\"beta; width: 120px; color: red`,
+      String.raw`alpha\"beta`,
+    ],
+    [
+      "single quote",
+      String.raw`--label: alpha\'beta; width: 120px; color: red`,
+      String.raw`alpha\'beta`,
+    ],
+  ])("preserves an escaped %s and the following declarations", (_name, style, label) => {
+    const parsed = parseMutable('<div data-hf-id="hf-x" data-hf-root></div>');
+    const el = parsed.document.querySelector('[data-hf-id="hf-x"]');
+    if (!el) throw new Error("missing fixture element");
+    el.setAttribute("style", style);
+    expect(getElementStyles(el)).toMatchObject({ "--label": label, width: "120px", color: "red" });
+    setElementStyles(el, { color: "blue" });
+    expect(getElementStyles(el)).toMatchObject({ "--label": label, width: "120px", color: "blue" });
+  });
+
+  it("treats the semicolon after an escaped backslash as a declaration boundary", () => {
+    const parsed = parseMutable('<div data-hf-id="hf-x" data-hf-root></div>');
+    const el = parsed.document.querySelector('[data-hf-id="hf-x"]');
+    if (!el) throw new Error("missing fixture element");
+    el.setAttribute("style", String.raw`--label: alpha\\; width: 120px; color: red`);
+    setElementStyles(el, { color: "blue" });
+    expect(getElementStyles(el)).toMatchObject({
+      "--label": String.raw`alpha\\`,
+      width: "120px",
+      color: "blue",
+    });
+  });
+});
+
 // ─── setVariableValue ─────────────────────────────────────────────────────────
 
 describe("setVariableValue", () => {
@@ -915,6 +1132,130 @@ describe("setVariableValue", () => {
   });
 });
 
+// ─── declareVariable / removeVariable ─────────────────────────────────────────
+
+/** Read a full variable decl (not just its default) for id, or undefined. */
+function readVarDecl(
+  parsed: ReturnType<typeof parseMutable>,
+  id: string,
+): Record<string, unknown> | undefined {
+  const raw = parsed.document.documentElement?.getAttribute("data-composition-variables");
+  if (!raw) return undefined;
+  const arr = JSON.parse(raw) as Array<Record<string, unknown>>;
+  return arr.find((v) => v.id === id);
+}
+
+describe("declareVariable", () => {
+  it("creates the data-composition-variables attribute from scratch when absent", () => {
+    const parsed = freshDoc(); // full doc, no data-composition-variables at all
+    expect(parsed.document.documentElement?.getAttribute("data-composition-variables")).toBeNull();
+    applyOp(parsed, {
+      type: "declareVariable",
+      declaration: { id: "brand-title", type: "string", label: "Title", default: "Hello" },
+    });
+    expect(readVarDecl(parsed, "brand-title")).toEqual({
+      id: "brand-title",
+      type: "string",
+      label: "Title",
+      default: "Hello",
+    });
+  });
+
+  it("appends a new declaration when the composition already has others", () => {
+    const parsed = freshWithVars();
+    applyOp(parsed, {
+      type: "declareVariable",
+      declaration: { id: "brand-tagline", type: "string", label: "Tagline", default: "Ship it" },
+    });
+    expect(readVarDecl(parsed, "brand-color-primary")).toBeDefined(); // untouched
+    expect(readVarDecl(parsed, "brand-tagline")?.default).toBe("Ship it");
+  });
+
+  it("declareVariable no-ops on an existing id; updateVariableDeclaration replaces the whole decl", () => {
+    const parsed = freshWithVars();
+    // Canonical semantics: declareVariable creates only — re-declaring an existing
+    // id is a no-op; updateVariableDeclaration is the path that replaces a decl.
+    applyOp(parsed, {
+      type: "declareVariable",
+      declaration: {
+        id: "brand-color-primary",
+        type: "color",
+        label: "Ignored",
+        default: "#111111",
+      },
+    });
+    expect(readVarDecl(parsed, "brand-color-primary")?.label).not.toBe("Ignored");
+    applyOp(parsed, {
+      type: "updateVariableDeclaration",
+      id: "brand-color-primary",
+      declaration: {
+        id: "brand-color-primary",
+        type: "color",
+        label: "Renamed",
+        default: "#00ff00",
+      },
+    });
+    const decl = readVarDecl(parsed, "brand-color-primary");
+    expect(decl?.label).toBe("Renamed");
+    expect(decl?.default).toBe("#00ff00");
+  });
+
+  it("succeeds where setVariableValue would refuse — creating an undeclared variable", () => {
+    const parsed = freshDoc();
+    // setVariableValue on an undeclared id still writes the --{id} CSS compat
+    // prop unconditionally (for CSS-only compositions with no JSON schema at
+    // all) — but the JSON model write itself no-ops, per writeVariableDefault's
+    // "don't auto-add declarations" contract. declareVariable is the only path
+    // that actually creates the schema entry.
+    applyOp(parsed, { type: "setVariableValue", id: "never-declared", value: "x" });
+    expect(readVarDecl(parsed, "never-declared")).toBeUndefined();
+    applyOp(parsed, {
+      type: "declareVariable",
+      declaration: { id: "never-declared", type: "string", label: "New", default: "x" },
+    });
+    expect(readVarDecl(parsed, "never-declared")?.default).toBe("x");
+  });
+
+  it("inverse restores the pre-declare state (remove on a fresh create, replace on an edit)", () => {
+    const parsed = freshWithVars();
+    const before = serializeDocument(parsed);
+
+    const created = applyOp(parsed, {
+      type: "declareVariable",
+      declaration: { id: "brand-new", type: "string", label: "New", default: "x" },
+    });
+    applyPatchesToDocument(parsed, created.inverse);
+    expect(serializeDocument(parsed)).toBe(before);
+  });
+});
+
+describe("removeVariable", () => {
+  it("removes the declaration entirely (not just the default)", () => {
+    const parsed = freshWithVars();
+    applyOp(parsed, { type: "removeVariable", id: "brand-color-primary" });
+    expect(readVarDecl(parsed, "brand-color-primary")).toBeUndefined();
+  });
+
+  it("no-ops (empty forward/inverse) when the id isn't declared", () => {
+    const parsed = freshWithVars();
+    const result = applyOp(parsed, { type: "removeVariable", id: "hf-nonexistent" });
+    expect(result.forward).toHaveLength(0);
+    expect(result.inverse).toHaveLength(0);
+  });
+
+  it("inverse restores the removed declaration", () => {
+    // Canonical remove re-adds the declaration on undo (array position is not
+    // preserved), so assert the decl is restored by content rather than exact
+    // byte-serialize.
+    const parsed = freshWithVars();
+    const original = readVarDecl(parsed, "brand-color-primary");
+    const result = applyOp(parsed, { type: "removeVariable", id: "brand-color-primary" });
+    expect(readVarDecl(parsed, "brand-color-primary")).toBeUndefined();
+    applyPatchesToDocument(parsed, result.inverse);
+    expect(readVarDecl(parsed, "brand-color-primary")).toEqual(original);
+  });
+});
+
 // ─── setCompositionMetadata ───────────────────────────────────────────────────
 
 describe("setCompositionMetadata", () => {
@@ -974,6 +1315,33 @@ describe("moveElement", () => {
     expect(el.getAttribute("data-x")).toBe("50");
     expect(el.getAttribute("data-y")).toBe("75");
   });
+
+  it("captures the pre-edit baseline on first move only", () => {
+    const parsed = fresh();
+    const el = parsed.document.querySelector('[data-hf-id="hf-title"]') as Element;
+    el.setAttribute("data-x", "50");
+    applyOp(parsed, { type: "moveElement", target: "hf-title", x: 100, y: 200 });
+    // Baseline = the values before the first edit (absent data-y → "0").
+    expect(el.getAttribute("data-hf-edit-base-x")).toBe("50");
+    expect(el.getAttribute("data-hf-edit-base-y")).toBe("0");
+    // A second move keeps the original baseline.
+    applyOp(parsed, { type: "moveElement", target: "hf-title", x: 300, y: 400 });
+    expect(el.getAttribute("data-hf-edit-base-x")).toBe("50");
+    expect(el.getAttribute("data-hf-edit-base-y")).toBe("0");
+    expect(el.getAttribute("data-x")).toBe("300");
+    expect(el.getAttribute("data-y")).toBe("400");
+  });
+
+  it("inverse of the first move removes the baseline attributes", () => {
+    const parsed = fresh();
+    const el = parsed.document.querySelector('[data-hf-id="hf-title"]') as Element;
+    const result = applyOp(parsed, { type: "moveElement", target: "hf-title", x: 100, y: 200 });
+    applyPatchesToDocument(parsed, result.inverse);
+    expect(el.getAttribute("data-hf-edit-base-x")).toBeNull();
+    expect(el.getAttribute("data-hf-edit-base-y")).toBeNull();
+    expect(el.getAttribute("data-x")).toBeNull();
+    expect(el.getAttribute("data-y")).toBeNull();
+  });
 });
 
 // ─── validateOp (can()) ───────────────────────────────────────────────────────
@@ -991,6 +1359,32 @@ describe("validateOp", () => {
 
   it("returns ok:true for setCompositionMetadata (no target)", () => {
     expect(validateOp(fresh(), { type: "setCompositionMetadata", width: 100 }).ok).toBe(true);
+  });
+
+  it("returns ok:true for declareVariable / removeVariable when a root exists", () => {
+    expect(
+      validateOp(freshDoc(), {
+        type: "declareVariable",
+        declaration: { id: "v1", type: "string", label: "V1", default: "x" },
+      }).ok,
+    ).toBe(true);
+    expect(validateOp(fresh(), { type: "removeVariable", id: "v1" }).ok).toBe(true);
+  });
+
+  it("refuses declareVariable / removeVariable on a rootless fragment", () => {
+    const parsed = parseMutable(`no elements at all — just text`);
+    // declareVariable runs its declaration precondition first, so a wrapped
+    // fragment (no real <html> to carry the schema) surfaces E_FRAGMENT_COMPOSITION.
+    const r1 = validateOp(parsed, {
+      type: "declareVariable",
+      declaration: { id: "v1", type: "string", label: "V1", default: "x" },
+    });
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.code).toBe("E_FRAGMENT_COMPOSITION");
+    // removeVariable only needs a root; there is none → E_NO_ROOT.
+    const r2 = validateOp(parsed, { type: "removeVariable", id: "v1" });
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.code).toBe("E_NO_ROOT");
   });
 });
 

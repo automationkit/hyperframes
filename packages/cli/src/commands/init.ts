@@ -1,5 +1,13 @@
+// The scaffolding command predates the complexity gate: run(), probeVideo,
+// handleVideoFile, and applyResolutionPreset carry its interactive branching.
+// This branch only repointed the scaffolded npm scripts; the refactor is its
+// own task.
+// fallow-ignore-file complexity
+import { failCommand, finishCommand } from "../utils/commandResult.js";
+import { writeNewFileSync } from "../utils/writeNewFile.js";
 import { defineCommand, runCommand } from "citty";
 import type { Example } from "./_examples.js";
+import { patchMediaPlaceholders, type InitMediaOptions } from "./initMedia.js";
 
 export const examples: Example[] = [
   ["Create a project with the interactive wizard", "hyperframes init my-video"],
@@ -8,7 +16,7 @@ export const examples: Example[] = [
   ["Scaffold a portrait video", "hyperframes init my-video --resolution portrait"],
   ["Start from an existing video file", "hyperframes init my-video --video clip.mp4"],
   ["Start from an audio file", "hyperframes init my-video --audio track.mp3"],
-  ["Scaffold with Tailwind CSS", "hyperframes init my-video --example blank --tailwind"],
+  ["Scaffold with Tailwind CSS", "hyperframes init my-video --tailwind"],
   ["Non-interactive mode (for CI or AI agents)", "hyperframes init my-video --non-interactive"],
   [
     "Opt out of the GitHub skills check (CI/tests only)",
@@ -37,7 +45,9 @@ import {
 } from "../templates/generators.js";
 import { fetchRemoteTemplate } from "../templates/remote.js";
 import { trackInitTemplate } from "../telemetry/events.js";
-import { hasFFmpeg } from "../whisper/manager.js";
+import { DEFAULT_MODEL, hasFFmpeg } from "../whisper/manager.js";
+import { TRANSCRIPT_FILE } from "../whisper/transcriptFile.js";
+import { initialModelForLanguage } from "../whisper/transcribe.js";
 import { findFFmpeg, findFFprobe, getFFmpegInstallHint } from "../browser/ffmpeg.js";
 import { VERSION } from "../version.js";
 import {
@@ -45,6 +55,18 @@ import {
   normalizeResolutionFlag,
   type CanvasResolution,
 } from "@hyperframes/core";
+import {
+  HTML_BODY_CSS_HEIGHT_FIRST_RE,
+  HTML_BODY_CSS_WIDTH_FIRST_RE,
+  VIEWPORT_META_SIZE_RE,
+} from "@hyperframes/parsers";
+
+function resolveScaffoldTemplateId(exampleFlag: string | undefined, hasMediaFile: boolean): string {
+  const example = exampleFlag === "agent" ? "blank" : exampleFlag;
+  if (example && example !== "blank") return example;
+  if (hasMediaFile) return "from-file";
+  return "blank";
+}
 
 interface VideoMeta {
   durationSeconds: number;
@@ -62,7 +84,8 @@ const DEFAULT_META: VideoMeta = {
   width: 1920,
   height: 1080,
   fps: 30,
-  hasAudio: false,
+  // ffprobe unavailable: assume sound. A wrong guess fails loudly at RENDER (lint catches it only once #3638 lands); assuming silence would mute real audio.
+  hasAudio: true,
   videoCodec: "h264",
 };
 
@@ -72,6 +95,22 @@ const TAILWIND_BROWSER_VERSION = "4.2.4";
 const TAILWIND_BROWSER_SRC = `https://cdn.jsdelivr.net/npm/@tailwindcss/browser@${TAILWIND_BROWSER_VERSION}/dist/index.global.js`;
 const TAILWIND_BROWSER_INTEGRITY =
   "sha384-v5YF9xS+gLRWdvrQ0u/WRbCkjSIH0NjHIPe8tBL1ZRrmI7PiSH6LLdzs0aAIMCuh";
+
+export function resolveVideoDurationSeconds({
+  streamDuration,
+  frameDuration,
+  formatDuration,
+}: {
+  streamDuration: number;
+  frameDuration: number;
+  formatDuration: number;
+}): number {
+  return (
+    [streamDuration, frameDuration, formatDuration].find(
+      (duration) => Number.isFinite(duration) && duration > 0,
+    ) ?? DEFAULT_META.durationSeconds
+  );
+}
 
 // ---------------------------------------------------------------------------
 // ffprobe helper — shells out to ffprobe to avoid engine dependency
@@ -83,7 +122,7 @@ function probeVideo(filePath: string): VideoMeta | undefined {
     if (!ffprobePath) return undefined;
     const raw = execFileSync(
       ffprobePath,
-      ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath],
+      ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", "--", filePath],
       { encoding: "utf-8", timeout: 15_000 },
     );
 
@@ -95,6 +134,8 @@ function probeVideo(filePath: string): VideoMeta | undefined {
         height?: number;
         r_frame_rate?: string;
         avg_frame_rate?: string;
+        duration?: string;
+        nb_frames?: string;
       }[];
       format?: { duration?: string };
     } = JSON.parse(raw);
@@ -116,11 +157,18 @@ function probeVideo(filePath: string): VideoMeta | undefined {
       }
     }
 
-    const durationStr = parsed.format?.duration;
-    const durationSeconds = durationStr !== undefined ? parseFloat(durationStr) : 5;
+    const streamDuration = parseFloat(videoStream.duration ?? "");
+    const frameCount = parseInt(videoStream.nb_frames ?? "", 10);
+    const frameDuration = Number.isFinite(frameCount) && fps > 0 ? frameCount / fps : NaN;
+    const formatDuration = parseFloat(parsed.format?.duration ?? "");
+    const durationSeconds = resolveVideoDurationSeconds({
+      streamDuration,
+      frameDuration,
+      formatDuration,
+    });
 
     return {
-      durationSeconds: Number.isNaN(durationSeconds) ? 5 : durationSeconds,
+      durationSeconds,
       width: videoStream.width ?? 1920,
       height: videoStream.height ?? 1080,
       fps,
@@ -138,7 +186,7 @@ function isWebCompatible(codec: string): boolean {
 
 // hasFFmpeg is imported from whisper/manager.ts to avoid duplication
 
-function transcodeToMp4(inputPath: string, outputPath: string): Promise<boolean> {
+export function transcodeToMp4(inputPath: string, outputPath: string): Promise<boolean> {
   return new Promise((resolvePromise) => {
     const ffmpegPath = findFFmpeg();
     if (!ffmpegPath) {
@@ -163,7 +211,7 @@ function transcodeToMp4(inputPath: string, outputPath: string): Promise<boolean>
         "-y",
         outputPath,
       ],
-      { stdio: "pipe" },
+      { stdio: "pipe", windowsHide: true },
     );
 
     child.on("close", (code) => resolvePromise(code === 0));
@@ -201,6 +249,25 @@ function getSharedTemplateDir(): string {
   return resolveAssetDir(["..", "templates", "_shared"], ["templates", "_shared"]);
 }
 
+/** The longest folder name the common disks hold: 255 UTF-8 bytes on Linux, 255 UTF-16 units on macOS and Windows. */
+const MAX_FOLDER_NAME = 255;
+
+/** One plain sentence when a folder in `name` is too long for the disk, null when all fit. Checked before mkdir,
+ * which otherwise throws Node's raw ENAMETOOLONG and the full path (repro: init a 256-character name). */
+export function nameTooLongMessage(
+  name: string,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const inBytes = platform === "linux";
+  const unit = inBytes ? "bytes" : "characters";
+  for (const folder of name.split(platform === "win32" ? /[\\/]/ : "/")) {
+    const length = inBytes ? Buffer.byteLength(folder) : folder.length;
+    if (length > MAX_FOLDER_NAME)
+      return `That name is ${length} ${unit} long; a folder name can be at most ${MAX_FOLDER_NAME} ${unit}.`;
+  }
+  return null;
+}
+
 function toPackageName(projectName: string): string {
   const normalized = basename(projectName)
     .trim()
@@ -224,9 +291,7 @@ function hyperframesScript(command: string): string {
 function buildPackageScripts(): Record<string, string> {
   return {
     dev: hyperframesScript("preview"),
-    check:
-      `${hyperframesScript("lint")} && ${hyperframesScript("validate")} && ` +
-      `${hyperframesScript("inspect")}`,
+    check: hyperframesScript("check"),
     render: hyperframesScript("render"),
     publish: hyperframesScript("publish"),
   };
@@ -236,7 +301,7 @@ function writeDefaultPackageJson(destDir: string, projectName: string): void {
   const packageJsonPath = resolve(destDir, "package.json");
   if (existsSync(packageJsonPath)) return;
 
-  writeFileSync(
+  writeNewFileSync(
     packageJsonPath,
     `${JSON.stringify(
       {
@@ -248,7 +313,6 @@ function writeDefaultPackageJson(destDir: string, projectName: string): void {
       null,
       2,
     )}\n`,
-    "utf-8",
   );
 }
 
@@ -306,31 +370,12 @@ function writeTailwindSupport(destDir: string): void {
   }
 }
 
-function patchVideoSrc(
-  dir: string,
-  videoFilename: string | undefined,
-  durationSeconds?: number,
-): void {
+function patchVideoSrc(dir: string, media: InitMediaOptions): void {
   const htmlFiles = readdirSync(dir, { withFileTypes: true, recursive: true })
     .filter((e) => e.isFile() && e.name.endsWith(".html"))
     .map((e) => join(e.parentPath, e.name));
-
   for (const file of htmlFiles) {
-    let content = readFileSync(file, "utf-8");
-    if (videoFilename) {
-      content = content.replaceAll("__VIDEO_SRC__", videoFilename);
-    } else {
-      // Remove video elements with placeholder src
-      content = content.replace(/<video[^>]*src="__VIDEO_SRC__"[^>]*>[\s\S]*?<\/video>/g, "");
-      content = content.replace(/<video[^>]*src="__VIDEO_SRC__"[^>]*>/g, "");
-      // Remove audio elements with placeholder src
-      content = content.replace(/<audio[^>]*src="__VIDEO_SRC__"[^>]*>[\s\S]*?<\/audio>/g, "");
-      content = content.replace(/<audio[^>]*src="__VIDEO_SRC__"[^>]*>/g, "");
-    }
-    // Patch duration — use probed duration or default
-    const dur = durationSeconds ? String(Math.round(durationSeconds * 100) / 100) : "10";
-    content = content.replaceAll("__VIDEO_DURATION__", dur);
-    writeFileSync(file, content, "utf-8");
+    writeFileSync(file, patchMediaPlaceholders(readFileSync(file, "utf-8"), media), "utf-8");
   }
 }
 
@@ -362,7 +407,7 @@ async function handleVideoFile(
       );
     }
   } else {
-    const msg = `ffprobe not found — using defaults (1920x1080, 5s, 30fps). Install: ${getFFmpegInstallHint()}`;
+    const msg = `ffprobe not found — using defaults (1920x1080, 5s, 30fps) and assuming the video has sound (data-has-audio="true"); if it is silent, replace that with muted. Install: ${getFFmpegInstallHint()}`;
     if (interactive) {
       clack.log.warn(msg);
     } else {
@@ -401,7 +446,7 @@ async function handleVideoFile(
         });
         if (clack.isCancel(transcode)) {
           clack.cancel("Setup cancelled.");
-          process.exit(0);
+          finishCommand(0);
         }
         shouldTranscode = transcode === "yes";
       }
@@ -490,20 +535,18 @@ export function applyResolutionPreset(destDir: string, resolution: CanvasResolut
 
     // Inline `html, body { ... }` CSS: handle width-before-height and
     // height-before-width orderings. Hand-authored templates can use either.
-    const bodyCssRe = /(html\s*,\s*body\s*\{[^}]*?width:\s*)\d+px([^}]*?height:\s*)\d+px/i;
-    if (bodyCssRe.test(html)) {
-      html = html.replace(bodyCssRe, `$1${width}px$2${height}px`);
+    // Groups 1 and 3 are the text before each dimension, 2 and 4 the digits.
+    if (HTML_BODY_CSS_WIDTH_FIRST_RE.test(html)) {
+      html = html.replace(HTML_BODY_CSS_WIDTH_FIRST_RE, `$1${width}px$3${height}px`);
       changed = true;
     }
-    const bodyCssReverseRe = /(html\s*,\s*body\s*\{[^}]*?height:\s*)\d+px([^}]*?width:\s*)\d+px/i;
-    if (bodyCssReverseRe.test(html)) {
-      html = html.replace(bodyCssReverseRe, `$1${height}px$2${width}px`);
+    if (HTML_BODY_CSS_HEIGHT_FIRST_RE.test(html)) {
+      html = html.replace(HTML_BODY_CSS_HEIGHT_FIRST_RE, `$1${height}px$3${width}px`);
       changed = true;
     }
 
-    const viewportRe = /(<meta[^>]*name=["']viewport["'][^>]*content=["'])width=\d+,\s*height=\d+/i;
-    if (viewportRe.test(html)) {
-      html = html.replace(viewportRe, `$1width=${width}, height=${height}`);
+    if (VIEWPORT_META_SIZE_RE.test(html)) {
+      html = html.replace(VIEWPORT_META_SIZE_RE, `$1${width}$3${height}`);
       changed = true;
     }
 
@@ -519,10 +562,10 @@ async function scaffoldProject(
   destDir: string,
   name: string,
   templateId: string,
-  localVideoName: string | undefined,
-  durationSeconds?: number,
+  media: InitMediaOptions,
   tailwind = false,
   resolution?: CanvasResolution,
+  authoringSkill?: string,
 ): Promise<void> {
   mkdirSync(destDir, { recursive: true });
 
@@ -535,7 +578,7 @@ async function scaffoldProject(
   } else {
     await fetchRemoteTemplate(templateId, destDir);
   }
-  patchVideoSrc(destDir, localVideoName, durationSeconds);
+  patchVideoSrc(destDir, media);
   if (tailwind) writeTailwindSupport(destDir);
   if (resolution) applyResolutionPreset(destDir, resolution);
 
@@ -555,10 +598,17 @@ async function scaffoldProject(
 
   // Write hyperframes.json so `hyperframes add` knows which registry to use
   // and where to drop block/component files. Overwritten only if absent.
+  // When the scaffolding workflow declared itself via --skill, stamp the owning
+  // skill here so every later render of this project is attributed to it.
   if (!existsSync(resolve(destDir, "hyperframes.json"))) {
-    const { writeProjectConfig, DEFAULT_PROJECT_CONFIG } =
+    const { createProjectConfig, DEFAULT_PROJECT_CONFIG } =
       await import("../utils/projectConfig.js");
-    writeProjectConfig(destDir, DEFAULT_PROJECT_CONFIG);
+    const { normalizeSkillSlug } = await import("../telemetry/skill.js");
+    const skill = normalizeSkillSlug(authoringSkill);
+    createProjectConfig(
+      destDir,
+      skill ? { ...DEFAULT_PROJECT_CONFIG, authoringSkill: skill } : DEFAULT_PROJECT_CONFIG,
+    );
   }
 
   writeDefaultPackageJson(destDir, name);
@@ -577,48 +627,46 @@ async function scaffoldProject(
 }
 
 /**
- * Ensure the AI coding skills are present and current. Checks the installed
- * skills against the latest published on GitHub and only (re)installs when
- * something is outdated or missing — so re-running `init` on an up-to-date
- * machine is a no-op. Best-effort: if the version check can't reach GitHub, it
- * installs anyway. The install itself (`installAllSkills`) installs the full set
- * once GLOBALLY (~/.claude/skills + ~/.agents/skills) and mirrors it into every
- * other installed agent, so it is project-independent — the check is global-first
- * to match.
+ * Keep the AI coding skills present and current — TARGETED, not the full
+ * set. Guarantees the core set (the `/hyperframes` entry router + shared
+ * domain skills) and refreshes any skill already installed; the end-user
+ * workflow skills are NOT pulled here — they install on demand when their
+ * workflow is triggered (`hyperframes skills update <name>`, which the router
+ * runs before entering a workflow). Re-running `init` on an up-to-date machine
+ * is a no-op, and `init` never expands a deliberate partial install.
+ * Best-effort: offline, it degrades to a presence check and never breaks init.
+ * The install itself lands once GLOBALLY (~/.claude/skills + ~/.agents/skills)
+ * and mirrors into every other installed agent, so it is project-independent —
+ * the check is global-first to match.
  */
-async function ensureSkillsCurrent(destDir: string): Promise<void> {
-  const { installAllSkills } = await import("./skills.js");
-  const { checkSkills } = await import("../utils/skillsManifest.js");
+async function keepSkillsCurrent(destDir: string): Promise<void> {
+  const { updateSkills } = await import("./skills.js");
 
   console.log();
   console.log(c.bold("Checking AI coding skills against GitHub..."));
-  let needsInstall = true;
+  // Wrap defensively (non-strict already swallows most failures): a
+  // skills-install failure can never break `init` itself — it warns and
+  // proceeds, since --skip-skills no longer escapes this path.
   try {
-    const result = await checkSkills({ cwd: destDir });
-    needsInstall = result.updateAvailable;
-  } catch {
-    // Couldn't reach GitHub (offline, rate-limited) — install anyway.
-  }
-
-  if (needsInstall) {
-    // installAllSkills installs the full set once globally and mirrors it into
-    // every installed agent's global dir — project-independent, so a freshly
-    // scaffolded project doesn't need any agent folders yet.
-    //
-    // Best-effort: installAllSkills (non-strict here) already swallows its own
-    // failures, but now that --skip-skills no longer escapes this path every
-    // init runs it — including offline ones, where checkSkills throws and we
-    // fall through to "install anyway". Wrap defensively so a skills-install
-    // failure can never break `init` itself; it only warns and proceeds.
-    try {
-      await installAllSkills({ cwd: destDir });
-    } catch (err) {
+    const result = await updateSkills({ refreshInstalled: true, cwd: destDir });
+    if (result.presenceOnly) {
+      // Freshness never got checked (GitHub unreachable) — don't claim
+      // "up to date"; the engine already reported what it could verify or
+      // blind-install. Point at the recovery command instead.
       console.log(
-        c.dim(`AI coding skills install skipped: ${err instanceof Error ? err.message : err}`),
+        c.dim("Skills freshness unverified — run `npx hyperframes skills update` when online."),
+      );
+    } else if (result.installed.length === 0) {
+      console.log(c.success("AI coding skills are already up to date."));
+    } else {
+      console.log(
+        c.dim("Workflow skills not installed here are added on demand, when first used."),
       );
     }
-  } else {
-    console.log(c.success("AI coding skills are already up to date."));
+  } catch (err) {
+    console.log(
+      c.dim(`AI coding skills install skipped: ${err instanceof Error ? err.message : err}`),
+    );
   }
 }
 
@@ -683,6 +731,11 @@ export default defineCommand({
       type: "boolean",
       description: "Disable interactive prompts (for CI/agents)",
     },
+    agent: {
+      type: "boolean",
+      hidden: true,
+      description: "Deprecated alias; default init is the centered blank",
+    },
     "skip-skills": {
       type: "boolean",
       description:
@@ -697,6 +750,13 @@ export default defineCommand({
       description:
         "Canvas resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840), square (1080x1080), square-4k (2160x2160). Aliases: 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square. Default: keep template dimensions (typically 1920x1080).",
     },
+    skill: {
+      type: "string",
+      description:
+        "Owning authoring workflow slug (e.g. product-launch-video). Stamped into " +
+        "hyperframes.json so every render of this project is attributed to it on " +
+        "anonymous telemetry, without re-passing --skill on each render. Ignored unless it is a slug.",
+    },
   },
   async run({ args }) {
     if (args.template !== undefined) {
@@ -707,7 +767,7 @@ export default defineCommand({
           `The --template flag was renamed to --example. Example:\n  npx hyperframes init ${args.name ?? "my-video"} --example "${args.template}"`,
         ),
       );
-      process.exit(1);
+      failCommand();
     }
     if (args["video-legacy"] !== undefined) {
       console.error(
@@ -715,7 +775,7 @@ export default defineCommand({
           `The -V short flag no longer maps to --video. Use --video (or -v). Example:\n  npx hyperframes init ${args.name ?? "my-video"} --video "${args["video-legacy"]}"`,
         ),
       );
-      process.exit(1);
+      failCommand();
     }
     const exampleFlag = args.example;
     const videoFlag = args.video;
@@ -733,9 +793,13 @@ export default defineCommand({
     const skipSkills = process.env.HYPERFRAMES_SKIP_SKILLS === "1";
     const skipSkillsFlagIgnored = args["skip-skills"] === true && !skipSkills;
     const tailwind = args.tailwind === true;
-    const nonInteractive = args["non-interactive"] === true;
+    const nonInteractive = args["non-interactive"] === true || args.agent === true;
     const modelFlag = args.model;
     const languageFlag = args.language;
+    const initialTranscriptionModel = initialModelForLanguage(
+      modelFlag ?? DEFAULT_MODEL,
+      languageFlag,
+    );
     const interactive = !nonInteractive && process.stdout.isTTY === true;
 
     if (skipSkillsFlagIgnored) {
@@ -758,7 +822,7 @@ export default defineCommand({
               `(or aliases 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square).`,
           ),
         );
-        process.exit(1);
+        failCommand();
       }
     }
 
@@ -766,18 +830,24 @@ export default defineCommand({
     // Non-interactive mode — all inputs from flags, defaults where missing
     // -----------------------------------------------------------------------
     if (!interactive) {
-      const templateId = exampleFlag ?? "blank";
+      const templateId = resolveScaffoldTemplateId(exampleFlag, Boolean(videoFlag || audioFlag));
       const name = args.name ?? "my-video";
       const destDir = resolve(name);
 
+      const tooLong = nameTooLongMessage(destDir);
+      if (tooLong) {
+        console.error(c.error(tooLong));
+        failCommand();
+      }
+
       if (existsSync(destDir) && readdirSync(destDir).length > 0) {
         console.error(c.error(`Directory already exists and is not empty: ${name}`));
-        process.exit(1);
+        failCommand();
       }
 
       if (videoFlag && audioFlag) {
         console.error(c.error("Cannot use --video and --audio together"));
-        process.exit(1);
+        failCommand();
       }
 
       // Validate source files before creating destDir so a failed run does
@@ -786,17 +856,18 @@ export default defineCommand({
       const videoPath = videoFlag ? resolve(videoFlag) : undefined;
       if (videoPath && !existsSync(videoPath)) {
         console.error(c.error(`Video file not found: ${videoFlag}`));
-        process.exit(1);
+        failCommand();
       }
       const audioPath = audioFlag ? resolve(audioFlag) : undefined;
       if (audioPath && !existsSync(audioPath)) {
         console.error(c.error(`Audio file not found: ${audioFlag}`));
-        process.exit(1);
+        failCommand();
       }
 
       mkdirSync(destDir, { recursive: true });
 
       let localVideoName: string | undefined;
+      let videoHasAudio = true;
       let videoDuration: number | undefined;
       let sourceFilePath: string | undefined;
 
@@ -805,6 +876,7 @@ export default defineCommand({
         sourceFilePath = videoPath;
         const result = await handleVideoFile(videoPath, destDir, false);
         localVideoName = result.localVideoName;
+        videoHasAudio = result.meta.hasAudio;
         videoDuration = result.meta.durationSeconds;
         console.log(
           `Video: ${result.meta.width}x${result.meta.height}, ${result.meta.durationSeconds.toFixed(1)}s`,
@@ -815,6 +887,8 @@ export default defineCommand({
       if (audioPath) {
         sourceFilePath = audioPath;
         copyFileSync(audioPath, resolve(destDir, basename(audioPath)));
+        const { getMediaDurationSeconds } = await import("../whisper/transcribe.js");
+        videoDuration = getMediaDurationSeconds(audioPath) ?? undefined;
         console.log(`Audio: ${basename(audioPath)}`);
       }
 
@@ -823,7 +897,7 @@ export default defineCommand({
         try {
           const { ensureWhisper, ensureModel } = await import("../whisper/manager.js");
           await ensureWhisper();
-          await ensureModel(modelFlag);
+          await ensureModel(initialTranscriptionModel);
           console.log("Transcribing...");
           const { transcribe: runTranscribe } = await import("../whisper/transcribe.js");
           const result = await runTranscribe(sourceFilePath, destDir, {
@@ -841,14 +915,19 @@ export default defineCommand({
 
       // Scaffold
       try {
+        const media: InitMediaOptions = {
+          video: localVideoName ? { filename: localVideoName, hasAudio: videoHasAudio } : undefined,
+          audio: audioPath ? { filename: basename(audioPath) } : undefined,
+          durationSeconds: videoDuration,
+        };
         await scaffoldProject(
           destDir,
           basename(destDir),
           templateId,
-          localVideoName,
-          videoDuration,
+          media,
           tailwind,
           resolutionPreset,
+          args.skill,
         );
       } catch (err) {
         console.error(
@@ -857,10 +936,10 @@ export default defineCommand({
           ),
         );
         console.error(c.dim("Use --example blank for offline use."));
-        process.exit(1);
+        failCommand();
       }
       trackInitTemplate(templateId, { tailwind });
-      const transcriptFile = resolve(destDir, "transcript.json");
+      const transcriptFile = resolve(destDir, TRANSCRIPT_FILE);
       if (existsSync(transcriptFile)) {
         await patchTranscript(destDir, transcriptFile);
       }
@@ -871,14 +950,16 @@ export default defineCommand({
       }
 
       if (!skipSkills) {
-        await ensureSkillsCurrent(destDir);
+        await keepSkillsCurrent(destDir);
       }
 
       console.log();
       console.log("Get started:");
       console.log();
       if (skipSkills) {
-        console.log(`  ${c.accent("1.")} Install AI coding skills (one-time):`);
+        console.log(
+          `  ${c.accent("1.")} Use your HyperFrames plugin, or install standalone skills:`,
+        );
         console.log(`     ${c.accent("npx hyperframes skills update")}`);
       } else {
         console.log(
@@ -895,7 +976,7 @@ export default defineCommand({
       console.log(
         `     ${c.dim('"Using /hyperframes, create a 15-second intro about [your topic]"')}`,
       );
-      console.log(`     ${c.dim("More patterns: hyperframes.heygen.com/guides/prompting")}`);
+      console.log(`     ${c.dim("More patterns: hyperframes.heygen.com/prompting/overview")}`);
       console.log();
       console.log(`  ${c.accent("4.")} Preview in the browser:`);
       console.log(`     ${c.accent(`cd ${name}`)} && ${c.accent("npm run dev")}`);
@@ -929,12 +1010,19 @@ export default defineCommand({
       });
       if (clack.isCancel(nameResult)) {
         clack.cancel("Setup cancelled.");
-        process.exit(0);
+        finishCommand(0);
       }
       name = nameResult;
     }
 
     const destDir = resolve(name);
+
+    const tooLong = nameTooLongMessage(destDir);
+    if (tooLong) {
+      clack.log.error(tooLong);
+      clack.cancel("Setup cancelled.");
+      failCommand();
+    }
 
     if (existsSync(destDir) && readdirSync(destDir).length > 0) {
       const overwrite = await clack.confirm({
@@ -943,12 +1031,13 @@ export default defineCommand({
       });
       if (clack.isCancel(overwrite) || !overwrite) {
         clack.cancel("Setup cancelled.");
-        process.exit(0);
+        finishCommand(0);
       }
     }
 
     // 2. Video/audio file handling (only via --video/--audio flags, no interactive prompt)
     let localVideoName: string | undefined;
+    let videoHasAudio = true;
     let sourceFilePath: string | undefined;
     let videoDuration: number | undefined;
 
@@ -957,23 +1046,26 @@ export default defineCommand({
       if (!existsSync(videoPath)) {
         clack.log.error(`File not found: ${videoFlag}`);
         clack.cancel("Setup cancelled.");
-        process.exit(1);
+        failCommand();
       }
       mkdirSync(destDir, { recursive: true });
       sourceFilePath = videoPath;
       const result = await handleVideoFile(videoPath, destDir, true);
       localVideoName = result.localVideoName;
+      videoHasAudio = result.meta.hasAudio;
       videoDuration = result.meta.durationSeconds;
     } else if (audioFlag) {
       const audioPath = resolve(audioFlag);
       if (!existsSync(audioPath)) {
         clack.log.error(`File not found: ${audioFlag}`);
         clack.cancel("Setup cancelled.");
-        process.exit(1);
+        failCommand();
       }
       mkdirSync(destDir, { recursive: true });
       sourceFilePath = audioPath;
       copyFileSync(audioPath, resolve(destDir, basename(audioPath)));
+      const { getMediaDurationSeconds } = await import("../whisper/transcribe.js");
+      videoDuration = getMediaDurationSeconds(audioPath) ?? undefined;
       clack.log.info(`Audio copied to ${c.accent(basename(audioPath))}`);
     }
 
@@ -1001,7 +1093,7 @@ export default defineCommand({
           await ensureWhisper({
             onProgress: (msg) => spin.message(msg),
           });
-          await ensureModel(modelFlag, {
+          await ensureModel(initialTranscriptionModel, {
             onProgress: (msg) => spin.message(msg),
           });
 
@@ -1026,8 +1118,8 @@ export default defineCommand({
     // 3. Pick example — skip prompt if --example was provided
     let templateId: string;
 
-    if (exampleFlag) {
-      templateId = exampleFlag;
+    if (exampleFlag || videoFlag || audioFlag) {
+      templateId = resolveScaffoldTemplateId(exampleFlag, Boolean(videoFlag || audioFlag));
     } else {
       // Resolve full template list (bundled + remote)
       const allTemplates = await resolveTemplateList();
@@ -1043,7 +1135,7 @@ export default defineCommand({
       });
       if (clack.isCancel(templateResult)) {
         clack.cancel("Setup cancelled.");
-        process.exit(0);
+        finishCommand(0);
       }
       templateId = templateResult;
     }
@@ -1055,14 +1147,19 @@ export default defineCommand({
       spin.start(`Downloading example ${c.accent(templateId)}...`);
     }
     try {
+      const media: InitMediaOptions = {
+        video: localVideoName ? { filename: localVideoName, hasAudio: videoHasAudio } : undefined,
+        audio: audioFlag ? { filename: basename(audioFlag) } : undefined,
+        durationSeconds: videoDuration,
+      };
       await scaffoldProject(
         destDir,
         name,
         templateId,
-        localVideoName,
-        videoDuration,
+        media,
         tailwind,
         resolutionPreset,
+        args.skill,
       );
       if (!isBundled) {
         spin.stop(c.success(`Downloaded ${templateId}`));
@@ -1074,12 +1171,12 @@ export default defineCommand({
       clack.log.error(
         `${err instanceof Error ? err.message : err}\n${c.dim("Use --example blank for offline use.")}`,
       );
-      process.exit(1);
+      failCommand();
     }
     trackInitTemplate(templateId, { tailwind });
 
     // 4b. Patch captions with transcript if available
-    const transcriptFile = resolve(destDir, "transcript.json");
+    const transcriptFile = resolve(destDir, TRANSCRIPT_FILE);
     if (existsSync(transcriptFile)) {
       await patchTranscript(destDir, transcriptFile);
     }
@@ -1087,11 +1184,12 @@ export default defineCommand({
     const files = readdirSync(destDir);
     clack.note(files.map((f) => c.accent(f)).join("\n"), c.success(`Created ${name}/`));
 
-    // Check skills against GitHub and (re)install only if outdated or missing —
-    // init is the one place the full set is pulled. The --skip-skills flag is
-    // temporarily neutered (see above); CI/tests opt out via HYPERFRAMES_SKIP_SKILLS=1.
+    // Check skills against GitHub and refresh only what's stale — the core set
+    // plus anything already installed; workflow skills install on demand. The
+    // --skip-skills flag is temporarily neutered (see above); CI/tests opt out
+    // via HYPERFRAMES_SKIP_SKILLS=1.
     if (!skipSkills) {
-      await ensureSkillsCurrent(destDir);
+      await keepSkillsCurrent(destDir);
     }
 
     // Auto-launch studio preview

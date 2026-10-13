@@ -4,7 +4,7 @@ import type { DomEditSelection } from "./domEditing";
 import { formatTimingValue, RESPONSIVE_GRID } from "./propertyPanelHelpers";
 import { MetricField, Section } from "./propertyPanelPrimitives";
 
-function parseTimingValue(input: string): number | null {
+export function parseTimingValue(input: string): number | null {
   const cleaned = input.replace(/s$/i, "").trim();
   const parsed = Number.parseFloat(cleaned);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
@@ -84,7 +84,7 @@ export function TimingSection({
       </div>
       {derived && (
         <p className="mt-2 text-[10px] leading-snug text-neutral-500">
-          Inferred from this element’s animation — edit to pin an explicit clip range.
+          Inferred from this element’s animation. Edit to pin an explicit clip range.
         </p>
       )}
     </Section>

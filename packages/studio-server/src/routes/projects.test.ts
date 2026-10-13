@@ -22,10 +22,9 @@ const COMPOSITION_HTML = '<html><body><div data-composition-id="main"></div></bo
 //   - .cache/examples/        a vendored dot-dir. walkDir does NOT special-case
 //                             it, so it stays listed in the file tree, but it is
 //                             gated out of composition discovery (isInHiddenOrVendorDir).
-//   - .hyperframes/examples/  vendored under Studio's dir — also listed in the
-//                             file tree, also gated out of discovery.
-//   - .hyperframes/backup/    Studio's internal snapshots — the only thing hidden
-//                             from the file tree (walkDir's shouldIgnoreDir).
+//   - .hyperframes/examples/  under the app's folder — gated out of discovery,
+//                             and hidden from the tree like every non-Studio record.
+//   - .hyperframes/backup/    Studio's internal snapshots — hidden from the tree.
 function createProjectDir(): string {
   const projectDir = mkdtempSync(join(tmpdir(), "hf-projects-test-"));
   tempDirs.push(projectDir);
@@ -58,6 +57,81 @@ function createAdapter(projectDir: string): StudioApiAdapter {
   };
 }
 
+describe("GET /projects/:id/signature", () => {
+  it("returns the adapter's cached signature when provided", async () => {
+    const projectDir = createProjectDir();
+    const app = new Hono();
+    registerProjectRoutes(app, {
+      ...createAdapter(projectDir),
+      getProjectSignature: () => "cached-sig",
+    });
+
+    const response = await app.request("http://localhost/projects/demo/signature");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ signature: "cached-sig" });
+  });
+
+  it("computes a signature that moves when project files change", async () => {
+    const projectDir = createProjectDir();
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+
+    const first = (await (
+      await app.request("http://localhost/projects/demo/signature")
+    ).json()) as {
+      signature: string;
+    };
+    expect(first.signature).toMatch(/^[0-9a-f]{24}$/);
+
+    writeFileSync(join(projectDir, "compositions", "scene.html"), "<html><body>new</body></html>");
+    const second = (await (
+      await app.request("http://localhost/projects/demo/signature")
+    ).json()) as { signature: string };
+    expect(second.signature).not.toBe(first.signature);
+  });
+
+  it("ignores generated cache writes while detecting source edits", async () => {
+    const projectDir = createProjectDir();
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+    const getSignature = async () =>
+      (
+        (await (await app.request("http://localhost/projects/demo/signature")).json()) as {
+          signature: string;
+        }
+      ).signature;
+
+    const initial = await getSignature();
+    const generatedFiles = [
+      [".transcode-cache", "proxy.mp4"],
+      [".thumbnails", "frame.jpg"],
+      [".waveform-cache", "peaks.json"],
+    ] as const;
+    const generatedSignatures: string[] = [];
+    for (const [dir, file] of generatedFiles) {
+      mkdirSync(join(projectDir, dir));
+      writeFileSync(join(projectDir, dir, file), `generated ${dir}`);
+      generatedSignatures.push(await getSignature());
+    }
+
+    expect(generatedSignatures).toEqual([initial, initial, initial]);
+
+    mkdirSync(join(projectDir, "src"));
+    writeFileSync(join(projectDir, "src", "scene.ts"), "export const scene = true;");
+    expect(await getSignature()).not.toBe(initial);
+  });
+
+  it("404s for an unknown project", async () => {
+    const app = new Hono();
+    registerProjectRoutes(app, {
+      ...createAdapter(createProjectDir()),
+      resolveProject: async () => null,
+    });
+    const response = await app.request("http://localhost/projects/nope/signature");
+    expect(response.status).toBe(404);
+  });
+});
+
 describe("registerProjectRoutes — composition discovery (#1384)", () => {
   it("excludes HTML inside dot-directories from compositions", async () => {
     const projectDir = createProjectDir();
@@ -74,8 +148,10 @@ describe("registerProjectRoutes — composition discovery (#1384)", () => {
     expect(payload.compositions).not.toContain(".hyperframes/examples/preset.html");
   });
 
-  it("lists vendored dot-directory files in the file tree but hides Studio backups", async () => {
+  it("lists vendored dot-directory files in the file tree, but nothing under .hyperframes/ that isn't Studio's", async () => {
     const projectDir = createProjectDir();
+    writeFileSync(join(projectDir, ".hyperframes", "app-history.jsonl"), "{}");
+    writeFileSync(join(projectDir, ".hyperframes", "studio-motion.json"), "{}");
     const app = new Hono();
     registerProjectRoutes(app, createAdapter(projectDir));
 
@@ -84,8 +160,24 @@ describe("registerProjectRoutes — composition discovery (#1384)", () => {
 
     // Vendored dot-dirs stay browsable — discovery is gated, the file tree is not.
     expect(payload.files).toContain(".cache/examples/preset.html");
-    expect(payload.files).toContain(".hyperframes/examples/preset.html");
-    // Only Studio's own backup snapshots are hidden from the tree (#1366).
-    expect(payload.files).not.toContain(".hyperframes/backup/snapshot.html");
+    expect(payload.files).toContain(".hyperframes/studio-motion.json");
+    for (const hidden of ["examples/preset.html", "backup/snapshot.html", "app-history.jsonl"])
+      expect(payload.files).not.toContain(`.hyperframes/${hidden}`);
+  });
+
+  it("omits generated cache files from the project file tree", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, ".transcode-cache"));
+    writeFileSync(join(projectDir, ".transcode-cache", "proxy.mp4"), "proxy");
+    mkdirSync(join(projectDir, ".waveform-cache"));
+    writeFileSync(join(projectDir, ".waveform-cache", "peaks.json"), "[]");
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo");
+    const payload = (await response.json()) as { files?: string[] };
+
+    expect(payload.files).not.toContain(".transcode-cache/proxy.mp4");
+    expect(payload.files).not.toContain(".waveform-cache/peaks.json");
   });
 });

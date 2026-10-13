@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { ensureHfIds, mintHfId } from "./hfIds.js";
+import { ensureHfIds, mintHfId, walkCompositionDescendants } from "./hfIds.js";
 import { parseHTML } from "linkedom";
+import { assignHfIds } from "./hfIdAssignment.js";
 
 function ids(html: string): string[] {
   const { document } = parseHTML(html);
@@ -17,7 +18,89 @@ function idOf(html: string, selector: string): string | null {
 
 const doc = (body: string) => `<!doctype html><html><body>${body}</body></html>`;
 
+describe("ensureHfIds fragment detection", () => {
+  it.each([
+    `<!-- Example: <html lang="en"> --><div id="stage"><p id="title">Hello</p></div>`,
+    `<!-- Example: <!doctype html> --><div id="stage"><p id="title">Hello</p></div>`,
+    `<div id="stage" title="<html>"><p id="title">Hello</p></div>`,
+    `<script>const example = "<!doctype html>";</script><div id="stage"><p id="title">Hello</p></div>`,
+  ])("stamps fragments containing document markers in inert text: %s", (html) => {
+    const out = ensureHfIds(html);
+    expect(ids(out)).toHaveLength(2);
+    expect(idOf(out, "#title")).toBe(
+      idOf(ensureHfIds(`<div id="stage"><p id="title">Hello</p></div>`), "#title"),
+    );
+    expect(out).not.toContain("<head>");
+    expect(out).not.toContain("<body>");
+    expect(ensureHfIds(out)).toBe(out);
+  });
+
+  it("preserves a full document following leading comments", () => {
+    const out = ensureHfIds(`<!-- note --><html><body><p id="title">Hello</p></body></html>`);
+    expect(out).toContain("<html>");
+    expect(idOf(out, "#title")).toMatch(/^hf-[a-z0-9]{4}$/);
+    expect(ensureHfIds(out)).toBe(out);
+  });
+});
+
 describe("ensureHfIds", () => {
+  it("ignores HTML attribute case and editor state while retaining pinned IDs", () => {
+    const lower = doc(`<div id="x" data-start="2" data-hf-state="a">hello</div>`);
+    const upper = doc(`<DIV ID="x" DATA-START="2" DATA-HF-STATE="b">hello</DIV>`);
+    expect(ids(ensureHfIds(upper))).toEqual(ids(ensureHfIds(lower)));
+    const pinned = ensureHfIds(doc(`<DIV DATA-HF-ID="pinned" DATA-START="2">hello</DIV>`));
+    expect(
+      new DOMParser()
+        .parseFromString(pinned, "text/html")
+        .querySelector("[data-start]")
+        ?.getAttribute("data-hf-id"),
+    ).toBe("pinned");
+  });
+
+  it.each([
+    `<TEMPLATE DATA-COMPOSITION-ID="sub"><DIV ID="x" DATA-START="2">hello</DIV></TEMPLATE>`,
+    `<TEMPLATE><DIV DATA-COMPOSITION-ID="sub"><DIV ID="x" DATA-START="2">hello</DIV></DIV></TEMPLATE>`,
+  ])("assigns matching IDs inside mixed-case composition templates: %s", (body) => {
+    const html = doc(body);
+    const native = new DOMParser().parseFromString(html, "text/html");
+    assignHfIds(native.body);
+    const persisted = new DOMParser().parseFromString(ensureHfIds(html), "text/html");
+    const collect = (document: Document): string[] => {
+      const result: string[] = [];
+      walkCompositionDescendants(document.body, (el) => {
+        if (el.tagName.toLowerCase() !== "template")
+          result.push(el.getAttribute("data-hf-id") ?? "missing");
+      });
+      return result;
+    };
+    expect(collect(native).length).toBeGreaterThan(0);
+    expect(collect(native)).not.toContain("missing");
+    expect(collect(native)).toEqual(collect(persisted));
+  });
+
+  it.each([
+    '<svg><linearGradient VIEWBOX="0 0 1 1"></linearGradient></svg>',
+    '<svg><linearGradient GRADIENTUNITS="userSpaceOnUse"></linearGradient></svg>',
+    '<svg><linearGradient ID="g" CLASS="paint" ARIA-LABEL="Gradient" DATA-HF-STATE="ignored"></linearGradient></svg>',
+    '<svg><linearGradient DATA-HF-ID="pinned" VIEWBOX="0 0 1 1"></linearGradient></svg>',
+  ])("matches persisted IDs for mixed-case SVG attributes: %s", (body) => {
+    const html = doc(body);
+    const native = new DOMParser().parseFromString(html, "text/html");
+    assignHfIds(native.body);
+    const persisted = new DOMParser().parseFromString(ensureHfIds(html), "text/html");
+    const collect = (document: Document) =>
+      Array.from(document.querySelectorAll("svg, linearGradient")).map((el) =>
+        el.getAttribute("data-hf-id"),
+      );
+    expect(collect(native)).toHaveLength(2);
+    expect(collect(native)).not.toContain(null);
+    expect(collect(native)).toEqual(collect(persisted));
+    expect(ensureHfIds(ensureHfIds(html))).toBe(ensureHfIds(html));
+    const gradient = persisted.querySelector("linearGradient");
+    if (body.includes("VIEWBOX")) expect(gradient?.getAttribute("viewBox")).toBe("0 0 1 1");
+    if (body.includes("DATA-HF-ID")) expect(gradient?.getAttribute("data-hf-id")).toBe("pinned");
+  });
+
   it("mints a hf- id on every editable element node in body", () => {
     const html = `<!doctype html><html><body>
       <div class="card"><h1>Hi</h1><img src="a.png"><span>x</span></div>
@@ -103,6 +186,68 @@ describe("ensureHfIds", () => {
 // once ids are persisted to source (pinning) AND the behavior for truly unpinned
 // HTML (no data-hf-id in the input — unreachable in production after write-back
 // landed in R7 Task 1-2, but still the correct contract for that path).
+describe("ensureHfIds — template-inner minting", () => {
+  // linkedom's querySelectorAll does not descend into <template>, so extract
+  // ids by regex over the serialized output instead of the DOM-walk helper.
+  const rawIds = (html: string) => [...html.matchAll(/data-hf-id="([^"]+)"/g)].map((m) => m[1]);
+
+  it("mints ids on elements inside a <template> (template itself stays unstamped)", () => {
+    const html = doc(
+      `<template data-composition-id="t"><div class="clip" data-start="0" data-end="3">Hi</div><p>x</p></template>`,
+    );
+    const out = ensureHfIds(html);
+    expect(rawIds(out)).toHaveLength(2); // div + p, not the template
+    expect(out).not.toMatch(/<template[^>]*data-hf-id/);
+  });
+
+  it("template-inner ids equal the ids minted for the same content unwrapped (preview parity)", () => {
+    const inner = `<div class="clip" data-start="0" data-end="3">Hi</div><p>x</p>`;
+    const wrapped = ensureHfIds(doc(`<template data-composition-id="t">${inner}</template>`));
+    const unwrapped = ensureHfIds(doc(inner));
+    expect(rawIds(wrapped)).toEqual(rawIds(unwrapped));
+  });
+
+  it("pins existing template-inner ids and seeds them against fresh mints", () => {
+    const html = doc(
+      `<template data-composition-id="t"><div data-hf-id="hf-keep">a</div><p>b</p></template>`,
+    );
+    const out = ensureHfIds(html);
+    expect(out).toContain('data-hf-id="hf-keep"');
+    expect(new Set(rawIds(out)).size).toBe(2);
+  });
+
+  it("descends nested composition templates", () => {
+    const html = doc(
+      `<template data-composition-id="a"><div>a</div><template data-composition-id="b"><span>b</span></template></template>`,
+    );
+    const out = ensureHfIds(html);
+    expect(rawIds(out)).toHaveLength(2); // div + span
+  });
+
+  it("does NOT stamp inside a plain <template> (runtime clone-source)", () => {
+    // A plain template's content is cloned N times into the live DOM at
+    // runtime; a persisted inner id would be duplicated across every clone.
+    const html = doc(`<div class="stage">x</div><template><li class="row">item</li></template>`);
+    const out = ensureHfIds(html);
+    expect(rawIds(out)).toHaveLength(1); // only the stage div
+    expect(out).not.toMatch(/<li[^>]*data-hf-id/);
+  });
+
+  it("does NOT stamp inside a plain template nested in a composition template", () => {
+    const html = doc(
+      `<template data-composition-id="t"><div>a</div><template><li>clone-src</li></template></template>`,
+    );
+    const out = ensureHfIds(html);
+    expect(rawIds(out)).toHaveLength(1); // only the div
+    expect(out).not.toMatch(/<li[^>]*data-hf-id/);
+  });
+
+  it("is idempotent for template-inner ids", () => {
+    const once = ensureHfIds(doc(`<template data-composition-id="t"><div>a</div></template>`));
+    expect(ensureHfIds(once)).toBe(once);
+  });
+});
+
 describe("ensureHfIds — edit lifecycle (R1 stability)", () => {
   it("pinned id survives a content edit (the §3 write-back guarantee)", () => {
     // Element already carries data-hf-id in source (as it would after write-back).

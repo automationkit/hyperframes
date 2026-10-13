@@ -1,7 +1,6 @@
-/**
- * Layer items, text fields, capabilities, selection resolution, and patch operations
- * for dom editing.
- */
+import { PREVIEW_ONLY_ATTRS } from "@hyperframes/core/studio-preview-mark";
+import { knownSourceAnswer, probeSourceElement, type ProbeTarget } from "./probeSourceElement";
+import { isAudibleVideoNode } from "../../player/lib/timelineElementHelpers";
 import type { PatchOperation } from "../../utils/sourcePatcher";
 import {
   resolveEditingAffordances,
@@ -25,21 +24,26 @@ import {
   getInlineStyles,
   getSelectorIndex,
   getSourceFileForElement,
+  isEditableTextLeaf,
   isHtmlElement,
-  isTextBearingTag,
 } from "./domEditingDom";
 import {
   findElementForSelection,
-  getDomLayerPatchTarget,
-  getDirectLayerChildren,
   getSelectionCandidate,
+  isDomLayerElement,
 } from "./domEditingElement";
 import { isCompositionRootLayer } from "./domEditingRootLayer";
+import { withSelectorIndexPass } from "../../utils/sourceScopedSelectorIndex";
+import { type DomEditLayerWalkCache, readDomEditLayerWalkEntry } from "./domEditLayerWalkCache";
 
-// ─── Text fields ────────────────────────────────────────────────────────────
-
-export function isEditableTextLeaf(el: HTMLElement): boolean {
-  return isTextBearingTag(el.tagName.toLowerCase()) && el.children.length === 0;
+function sameTagChildIndex(el: HTMLElement): number {
+  let index = 0;
+  let sibling = el.previousElementSibling;
+  while (sibling) {
+    if (sibling.tagName === el.tagName) index += 1;
+    sibling = sibling.previousElementSibling;
+  }
+  return index;
 }
 
 function getTextFieldLabel(
@@ -52,11 +56,14 @@ function getTextFieldLabel(
   return `Text ${index + 1}`;
 }
 
+const NOT_COPIED_ATTRS = new Set<string>(["style", ...PREVIEW_ONLY_ATTRS]);
+
 function buildTextField(
   el: HTMLElement,
   index: number,
   total: number,
   source: "self" | "child",
+  sourceChildIndex?: number,
 ): DomEditTextField {
   const tagName = el.tagName.toLowerCase();
   const key = el.getAttribute("data-hf-text-key") ?? `${source}:${index}:${tagName}`;
@@ -66,7 +73,7 @@ function buildTextField(
     value: el.textContent ?? "",
     tagName,
     attributes: Array.from(el.attributes)
-      .filter((attribute) => attribute.name !== "style")
+      .filter((attribute) => !NOT_COPIED_ATTRS.has(attribute.name))
       .map((attribute) => ({
         name: attribute.name,
         value: attribute.value,
@@ -74,6 +81,7 @@ function buildTextField(
     inlineStyles: getInlineStyles(el),
     computedStyles: getCuratedComputedStyles(el),
     source,
+    ...(sourceChildIndex == null ? {} : { sourceChildIndex }),
   };
 }
 
@@ -105,7 +113,9 @@ export function collectDomEditTextFields(el: HTMLElement): DomEditTextField[] {
           });
           childIdx++;
         } else if (isHtmlElement(node) && isEditableTextLeaf(node)) {
-          fields.push(buildTextField(node, childIdx, childElements.length, "child"));
+          fields.push(
+            buildTextField(node, childIdx, childElements.length, "child", sameTagChildIndex(node)),
+          );
           childIdx++;
         }
       }
@@ -113,7 +123,7 @@ export function collectDomEditTextFields(el: HTMLElement): DomEditTextField[] {
     }
 
     return childElements.map((child, index) =>
-      buildTextField(child, index, childElements.length, "child"),
+      buildTextField(child, index, childElements.length, "child", sameTagChildIndex(child)),
     );
   }
 
@@ -172,14 +182,30 @@ export function buildDefaultDomEditTextField(base?: Partial<DomEditTextField>): 
   };
 }
 
-// ─── Capabilities ────────────────────────────────────────────────────────────
+export interface DomEditChildLocator {
+  childSelector: string;
+  childIndex: number;
+}
 
-/**
- * Build the geometry/capability half of EditableElementFacts. Section inputs
- * (text/timing/animation) are irrelevant to capability resolution, so they are
- * zeroed here. Shared by the wrapper and the live-selection path so the two
- * fact-construction sites can't disagree.
- */
+export function buildTextFieldChildLocator(
+  fields: DomEditTextField[],
+  fieldKey: string,
+): DomEditChildLocator | null {
+  const field = fields.find((candidate) => candidate.key === fieldKey);
+  if (!field || field.source !== "child") return null;
+  // sourceChildIndex is only absent for a synthetic field that was never read
+  // back from the live DOM (e.g. one built by buildDefaultDomEditTextField).
+  // Guessing its position by counting same-tag "child" fields elsewhere in
+  // the array is unreliable and can silently locate the wrong element — fail
+  // closed instead so the caller falls back to the unsupported-structure path.
+  if (field.sourceChildIndex == null) return null;
+
+  return {
+    childSelector: `:scope > ${field.tagName}`,
+    childIndex: field.sourceChildIndex,
+  };
+}
+
 function capabilityFacts(geometry: {
   hasStableTarget: boolean;
   tag: string;
@@ -222,6 +248,7 @@ export function domEditSelectionToFacts(
     hasEditableText: selection.textFields.length > 0,
     hasTimingStart: selection.dataAttributes.start != null,
     animationCount,
+    hasAudio: isAudibleVideoNode(selection.element),
   };
 }
 
@@ -257,43 +284,22 @@ export function resolveDomEditCapabilities(args: {
   ).capabilities;
 }
 
-// ─── Element label ────────────────────────────────────────────────────────────
-
-// ─── Source probe ────────────────────────────────────────────────────────────
-
-async function probeSourceElement(
-  projectId: string,
-  sourceFile: string,
-  target: { id?: string; hfId?: string; selector?: string; selectorIndex?: number },
-): Promise<boolean> {
-  try {
-    const response = await fetch(
-      `/api/projects/${projectId}/file-mutations/probe-element/${encodeURIComponent(sourceFile)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target }),
-      },
-    );
-    if (!response.ok) return true;
-    const data = (await response.json()) as { exists?: boolean };
-    return data.exists !== false;
-  } catch {
-    return true;
-  }
-}
-
-// ─── Selection resolution ────────────────────────────────────────────────────
-
 // fallow-ignore-next-line complexity
 export async function resolveDomEditSelection(
   startEl: HTMLElement | null,
-  options: DomEditContextOptions & { projectId?: string | null; skipSourceProbe?: boolean },
+  options: DomEditContextOptions & {
+    projectId?: string | null;
+    skipSourceProbe?: boolean;
+    exactTarget?: boolean;
+    previous?: DomEditSelection | null;
+  },
 ): Promise<DomEditSelection | null> {
   if (!startEl) return null;
   const doc = startEl.ownerDocument;
 
-  let capture = resolveGroupCapture(startEl, options.activeGroupElement ?? null);
+  let capture = options.exactTarget
+    ? ({ kind: "unit", element: startEl } as const)
+    : resolveGroupCapture(startEl, options.activeGroupElement ?? null);
   if (capture.kind === "out-of-scope") {
     // Drill-in is non-sticky: clicking/hovering OUTSIDE the drilled-into group
     // exits it and resolves the target normally, rather than selecting nothing
@@ -328,14 +334,14 @@ export async function resolveDomEditSelection(
       isCompositionRootLayer(current, doc, computedStyles);
     const textFields = collectDomEditTextFields(current);
     const isInsideLocked = Boolean(findClosestByAttribute(current, ["data-timeline-locked"]));
-    let existsInSource: boolean | undefined;
-    if (!options.skipSourceProbe && options.projectId && (current.id || selector || hfId)) {
-      const probeTarget: { id?: string; hfId?: string; selector?: string; selectorIndex?: number } =
-        {};
-      if (current.id) probeTarget.id = current.id;
-      if (hfId) probeTarget.hfId = hfId;
-      if (selector) probeTarget.selector = selector;
-      if (selectorIndex != null) probeTarget.selectorIndex = selectorIndex;
+    const probeTarget: ProbeTarget = {};
+    if (current.id) probeTarget.id = current.id;
+    if (hfId) probeTarget.hfId = hfId;
+    if (selector) probeTarget.selector = selector;
+    if (selectorIndex != null) probeTarget.selectorIndex = selectorIndex;
+    let existsInSource = knownSourceAnswer(options.previous, current, sourceFile, probeTarget);
+    const probe = existsInSource === undefined && !options.skipSourceProbe;
+    if (probe && options.projectId && (current.id || selector || hfId)) {
       existsInSource = await probeSourceElement(options.projectId, sourceFile, probeTarget);
     }
     const capabilities = resolveEditingAffordances(
@@ -378,6 +384,7 @@ export async function resolveDomEditSelection(
       computedStyles,
       textFields,
       capabilities,
+      existsInSource,
     };
   }
 
@@ -418,7 +425,7 @@ export function countDomEditChildLayers(
   const visit = (el: HTMLElement) => {
     for (const child of Array.from(el.children)) {
       if (!isHtmlElement(child)) continue;
-      if (getDomLayerPatchTarget(child, options.activeCompositionPath)) {
+      if (isDomLayerElement(child)) {
         count += 1;
         if (count >= maxCount) return;
       }
@@ -431,27 +438,34 @@ export function countDomEditChildLayers(
   return count;
 }
 
+// Every editable element under `root`, in document order. `maxItems` is a
+// caller's rendering budget, not a property of the document: hit-testing
+// callers (marquee, off-canvas indicators) must see all of it, and sharing a
+// truncated list left everything past the cut unselectable however far you drag.
 export function collectDomEditLayerItems(
   root: HTMLElement | null | undefined,
   options: DomEditContextOptions,
-  maxItems = 80,
+  maxItems = Number.POSITIVE_INFINITY,
+  cache?: DomEditLayerWalkCache,
 ): DomEditLayerItem[] {
   if (!root) return [];
+  cache?.beginWalk(options.activeCompositionPath);
 
   const items: DomEditLayerItem[] = [];
   // fallow-ignore-next-line complexity
   const visit = (el: HTMLElement, depth: number) => {
     if (items.length >= maxItems) return;
 
-    const target = getDomLayerPatchTarget(el, options.activeCompositionPath);
-    if (target) {
+    const entry = readDomEditLayerWalkEntry(el, options.activeCompositionPath, cache);
+    if (entry) {
+      const { target } = entry;
       items.push({
         key: getDomEditLayerKey(target),
         element: el,
-        label: buildElementLabel(el),
+        label: entry.label,
         tagName: el.tagName.toLowerCase(),
         depth,
-        childCount: getDirectLayerChildren(el, options).length,
+        childCount: entry.childCount,
         id: target.id ?? undefined,
         hfId: target.hfId ?? undefined,
         selector: target.selector ?? undefined,
@@ -460,7 +474,7 @@ export function collectDomEditLayerItems(
       });
     }
 
-    const nextDepth = target ? depth + 1 : depth;
+    const nextDepth = entry ? depth + 1 : depth;
     for (const child of Array.from(el.children)) {
       if (!isHtmlElement(child)) continue;
       visit(child, nextDepth);
@@ -468,27 +482,53 @@ export function collectDomEditLayerItems(
     }
   };
 
-  // Drilled into a group → show only its members; otherwise the whole tree.
-  for (const el of groupScopedLayerRoots(root, options.activeGroupElement ?? null)) visit(el, 0);
+  // Every item resolves its selector's occurrence index, and unshared that is a
+  // whole-document query per element — quadratic once a composition repeats a
+  // card or tile class. The walk is one synchronous read of a document it does
+  // not mutate, so one index per selector serves the whole of it. The pass lives
+  // here rather than in each caller because this function owns the loop.
+  withSelectorIndexPass(root.ownerDocument, () => {
+    // Drilled into a group → show only its members; otherwise the whole tree.
+    for (const el of groupScopedLayerRoots(root, options.activeGroupElement ?? null)) visit(el, 0);
+  });
   return items;
+}
+
+export function liveLayerElement(
+  layer: DomEditLayerItem,
+  doc: Document | null | undefined,
+  activeCompositionPath: string | null,
+): HTMLElement {
+  if (layer.element.isConnected || !doc) return layer.element;
+  return findElementForSelection(doc, layer, activeCompositionPath) ?? layer.element;
 }
 
 // ─── Patch operations ────────────────────────────────────────────────────────
 
-export function buildDomEditStylePatchOperation(property: string, value: string): PatchOperation {
+export function buildDomEditStylePatchOperation(
+  property: string,
+  value: string | null,
+  childLocator?: DomEditChildLocator,
+): PatchOperation {
   return {
     type: "inline-style",
     property,
     value,
+    ...childLocator,
   };
 }
 
-export function buildDomEditTextPatchOperation(value: string): PatchOperation {
-  return {
-    type: "text-content",
-    property: "text",
-    value,
-  };
+export function buildDomEditTextPatchOperation(
+  value: string,
+  childLocator?: DomEditChildLocator,
+): PatchOperation {
+  return { type: "text-content", property: "text", value, ...childLocator };
+}
+
+/** Replace an element's contents with markup, for a change no per-child operation
+ * can express (a text layer added, removed or reordered). Sanitized at both ends. */
+export function buildDomEditRichTextPatchOperation(value: string): PatchOperation {
+  return { type: "rich-text", property: "", value };
 }
 
 // ─── Non-editable reason ─────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import {
   blitRgb48leAffine,
   parseTransformMatrix,
   convertTransfer,
+  isVideoHiddenBeforeStreamStart,
 } from "@hyperframes/engine";
 import type { ProducerLogger } from "../logger.js";
 import { type HdrImageTransferCache } from "./hdrImageTransferCache.js";
@@ -139,6 +140,10 @@ export interface HdrVideoFrameSource {
   frameSize: number;
   frameCount: number;
   scratch: Buffer;
+  /** The raw file contains one playable source cycle and must wrap at EOF. */
+  loop?: boolean;
+  mediaStart?: number;
+  videoStreamLeadSeconds?: number;
 }
 
 export function closeHdrVideoFrameSource(source: HdrVideoFrameSource, log?: ProducerLogger): void {
@@ -150,6 +155,18 @@ export function closeHdrVideoFrameSource(source: HdrVideoFrameSource, log?: Prod
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+export function resolveHdrVideoFrameIndex(
+  time: number,
+  startTime: number,
+  fps: number,
+  frameCount: number,
+  loop = false,
+): number | null {
+  const frameIndex = Math.round((time - startTime) * fps);
+  if (frameIndex < 0 || frameCount < 1) return null;
+  return loop ? frameIndex % frameCount : Math.min(frameIndex, frameCount - 1);
 }
 
 // fallow-ignore-next-line complexity
@@ -173,14 +190,20 @@ export function blitHdrVideoLayer(
     return;
   }
 
-  // Frame index within the video. Clamp to the extracted raw frame count so
-  // a composition that outlives the source clip freezes on the last frame,
-  // matching Chrome's <video> behavior.
-  const videoFrameIndex = Math.round((time - startTime) * fps) + 1;
-  if (videoFrameIndex < 1) return;
-  const effectiveIndex = Math.min(videoFrameIndex, frameSource.frameCount);
-  if (effectiveIndex < 1) return;
-  const frameOffset = (effectiveIndex - 1) * frameSource.frameSize;
+  // Frame index within the extracted playable source range. Loops wrap one
+  // extracted cycle; non-loops clamp to its final frame, matching Chrome's
+  // held-tail behavior for authored slots that outlive the source.
+  const effectiveIndex = resolveHdrVideoFrameIndex(
+    time,
+    startTime,
+    fps,
+    frameSource.frameCount,
+    frameSource.loop,
+  );
+  if (effectiveIndex === null) return;
+  const mediaTime = (frameSource.mediaStart ?? 0) + effectiveIndex / fps;
+  if (isVideoHiddenBeforeStreamStart(frameSource.videoStreamLeadSeconds, mediaTime)) return;
+  const frameOffset = effectiveIndex * frameSource.frameSize;
 
   try {
     if (hdrPerf) hdrPerf.hdrVideoLayerBlits += 1;
@@ -242,7 +265,7 @@ export function blitHdrVideoLayer(
       if (matrix && !isTranslationOnly) {
         if (clipped && log) {
           log.debug(
-            `HDR clip rect on affine-transformed element ${el.id} — clip not applied (affine scissor not yet supported)`,
+            `HDR clip rect on affine-transformed element ${el.id}: clip not applied (affine scissor not yet supported)`,
           );
         }
         blitRgb48leAffine(
@@ -331,7 +354,7 @@ export function blitHdrImageLayer(
     return;
   }
   if (el.clipRect && log) {
-    log.debug(`HDR clip rect on image element ${el.id} — clip not yet supported for images`);
+    log.debug(`HDR clip rect on image element ${el.id}: clip not yet supported for images`);
   }
 
   try {
@@ -414,6 +437,17 @@ export function resolveCompositeTransfer(
   effectiveHdr: { transfer: HdrTransfer } | undefined,
 ): CompositeTransfer {
   return hasHdrContent && effectiveHdr ? effectiveHdr.transfer : "srgb";
+}
+
+export function selectDomLayerShowIds(
+  layerElementIds: string[],
+  fullStacking: ElementStackingInfo[],
+): string[] {
+  const byId = new Map(fullStacking.map((el) => [el.id, el]));
+  return layerElementIds.filter((id) => {
+    const el = byId.get(id);
+    return !!el && el.opacity > 0 && (el.visible || el.renderFrameVisible === true);
+  });
 }
 
 export interface HdrCompositeContext {
@@ -607,10 +641,10 @@ export async function compositeHdrFrame(
       //
       // The mask:
       //   - mass-hides every body descendant via stylesheet
-      //   - re-shows the layer's elements (and their descendants and
-      //     their injected `__render_frame_*` siblings) so deep-nested
-      //     content stays visible even though intermediate ancestors
-      //     are hidden
+      //   - re-shows the layer's currently paintable elements (and their
+      //     descendants and injected `__render_frame_*` siblings) so
+      //     deep-nested content stays visible even though intermediate
+      //     ancestors are hidden
       //   - inline-hides every other data-start element so they don't
       //     paint when they happen to be descendants of a layer element
       //     (most importantly: HDR videos and other-layer SDR videos
@@ -621,6 +655,17 @@ export async function compositeHdrFrame(
       // border/box-shadow of cards, etc.) and the resulting opaque
       // pixels overwrite previously composited HDR content beneath.
       const layerIds = new Set(layer.elementIds);
+      const showIds = selectDomLayerShowIds(layer.elementIds, fullStacking);
+      if (showIds.length === 0) {
+        if (shouldLog) {
+          log.info("[diag] dom layer skipped, all elements not paintable", {
+            frame: debugFrameIndex,
+            layerIdx,
+            layerIds: layer.elementIds,
+          });
+        }
+        continue;
+      }
       const hideIds = allElementIds.filter((id) => !layerIds.has(id));
       if (hdrPerf) hdrPerf.domLayerCaptures += 1;
 
@@ -640,7 +685,7 @@ export async function compositeHdrFrame(
 
       // 3. Install the mask (mass-hide stylesheet + inline-hide non-layer ids)
       await timeHdrPhaseAsync(hdrPerf, "domMaskApplyMs", () =>
-        applyDomLayerMask(domSession.page, layer.elementIds, hideIds),
+        applyDomLayerMask(domSession.page, showIds, hideIds),
       );
 
       // 4. Screenshot
@@ -669,6 +714,7 @@ export async function compositeHdrFrame(
             frame: debugFrameIndex,
             layerIdx,
             layerIds: layer.elementIds,
+            showIds,
             hideCount: hideIds.length,
             pngBytes: domPng.length,
             alphaPixels,

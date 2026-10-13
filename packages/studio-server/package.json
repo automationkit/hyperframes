@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/studio-server",
-  "version": "0.7.26",
+  "version": "0.8.153",
   "repository": {
     "type": "git",
     "url": "https://github.com/heygen-com/hyperframes",
@@ -27,6 +27,24 @@
       "import": "./src/helpers/screenshotClip.ts",
       "types": "./src/helpers/screenshotClip.ts"
     },
+    "./safe-path": {
+      "bun": "./src/helpers/safePath.ts",
+      "node": "./dist/helpers/safePath.js",
+      "import": "./src/helpers/safePath.ts",
+      "types": "./src/helpers/safePath.ts"
+    },
+    "./hf-ids": {
+      "bun": "./src/helpers/hfIdPersist.ts",
+      "node": "./dist/helpers/hfIdPersist.js",
+      "import": "./src/helpers/hfIdPersist.ts",
+      "types": "./src/helpers/hfIdPersist.ts"
+    },
+    "./history": {
+      "bun": "./src/history/index.ts",
+      "node": "./dist/history/index.js",
+      "import": "./src/history/index.ts",
+      "types": "./src/history/index.ts"
+    },
     "./manual-edits-render-script": {
       "bun": "./src/helpers/manualEditsRenderScript.ts",
       "node": "./dist/helpers/manualEditsRenderScript.js",
@@ -50,6 +68,36 @@
       "node": "./dist/helpers/finiteMutation.js",
       "import": "./src/helpers/finiteMutation.ts",
       "types": "./src/helpers/finiteMutation.ts"
+    },
+    "./source-mutation": {
+      "bun": "./src/helpers/sourceMutation.ts",
+      "node": "./dist/helpers/sourceMutation.js",
+      "import": "./src/helpers/sourceMutation.ts",
+      "types": "./src/helpers/sourceMutation.ts"
+    },
+    "./media-codec-map": {
+      "bun": "./src/helpers/mediaCodecMap.ts",
+      "node": "./dist/helpers/mediaCodecMap.js",
+      "import": "./src/helpers/mediaCodecMap.ts",
+      "types": "./src/helpers/mediaCodecMap.ts"
+    },
+    "./proxy-transcoder": {
+      "bun": "./src/helpers/proxyTranscoder.ts",
+      "node": "./dist/helpers/proxyTranscoder.js",
+      "import": "./src/helpers/proxyTranscoder.ts",
+      "types": "./src/helpers/proxyTranscoder.ts"
+    },
+    "./loudness": {
+      "bun": "./src/helpers/loudness.ts",
+      "node": "./dist/helpers/loudness.js",
+      "import": "./src/helpers/loudness.ts",
+      "types": "./src/helpers/loudness.ts"
+    },
+    "./media-proxy-preview": {
+      "bun": "./src/helpers/mediaProxyPreview.ts",
+      "node": "./dist/helpers/mediaProxyPreview.js",
+      "import": "./src/helpers/mediaProxyPreview.ts",
+      "types": "./src/helpers/mediaProxyPreview.ts"
     }
   },
   "publishConfig": {
@@ -63,6 +111,18 @@
       "./screenshot-clip": {
         "import": "./dist/helpers/screenshotClip.js",
         "types": "./dist/helpers/screenshotClip.d.ts"
+      },
+      "./safe-path": {
+        "import": "./dist/helpers/safePath.js",
+        "types": "./dist/helpers/safePath.d.ts"
+      },
+      "./hf-ids": {
+        "import": "./dist/helpers/hfIdPersist.js",
+        "types": "./dist/helpers/hfIdPersist.d.ts"
+      },
+      "./history": {
+        "import": "./dist/history/index.js",
+        "types": "./dist/history/index.d.ts"
       },
       "./manual-edits-render-script": {
         "import": "./dist/helpers/manualEditsRenderScript.js",
@@ -79,6 +139,26 @@
       "./finite-mutation": {
         "import": "./dist/helpers/finiteMutation.js",
         "types": "./dist/helpers/finiteMutation.d.ts"
+      },
+      "./source-mutation": {
+        "import": "./dist/helpers/sourceMutation.js",
+        "types": "./dist/helpers/sourceMutation.d.ts"
+      },
+      "./media-codec-map": {
+        "import": "./dist/helpers/mediaCodecMap.js",
+        "types": "./dist/helpers/mediaCodecMap.d.ts"
+      },
+      "./proxy-transcoder": {
+        "import": "./dist/helpers/proxyTranscoder.js",
+        "types": "./dist/helpers/proxyTranscoder.d.ts"
+      },
+      "./loudness": {
+        "import": "./dist/helpers/loudness.js",
+        "types": "./dist/helpers/loudness.d.ts"
+      },
+      "./media-proxy-preview": {
+        "import": "./dist/helpers/mediaProxyPreview.js",
+        "types": "./dist/helpers/mediaProxyPreview.d.ts"
       }
     },
     "main": "./dist/index.js",
@@ -87,8 +167,10 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
+    "test:acorn-writer": "bun scripts/run-acorn-writer-tests.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "report:gsap-writers": "bun src/routes/gsapMutationCapabilities.report.ts",
     "prepublishOnly": "echo skip"
   },
   "dependencies": {
@@ -97,13 +179,14 @@
     "hono": "^4.0.0",
     "linkedom": "^0.18.12",
     "postcss": "^8.5.8",
-    "postcss-selector-parser": "^7.1.2"
+    "postcss-selector-parser": "^7.1.2",
+    "sharp": "^0.35.0"
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
     "tsup": "^8.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.0.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

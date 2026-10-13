@@ -1,18 +1,44 @@
 export { shouldBlockRender } from "./shouldBlockRender.js";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, extname, isAbsolute, join, posix, relative, resolve } from "node:path";
-import { decodeUrlPathVariants } from "@hyperframes/parsers/composition";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { rewriteAssetPath } from "@hyperframes/parsers/asset-paths";
 import { checkSubCompositionUsability } from "@hyperframes/parsers/sub-composition-validity";
 import { parseHTML } from "linkedom";
+import {
+  cleanAssetUrl,
+  collectSubCompositionSrcs,
+  isRemoteOrInlineUrl,
+  isUnresolvedAssetPlaceholder,
+  isWithinProjectRoot,
+  maskNonScannableRanges,
+  readProjectFile,
+  resolveExistingLocalAsset,
+  resolveLocalAssetCandidates,
+  resolveProjectRelativeSrc,
+} from "@hyperframes/parsers/asset-resolution";
+import {
+  collectLocalVideoCandidates,
+  lintHevcPreviewCodec,
+  lintVideoMediaStartPastEof,
+} from "./hevcPreviewLint.js";
 import { lintHyperframeHtml } from "./hyperframeLinter.js";
-import type { HyperframeLintFinding, HyperframeLintResult } from "./types.js";
+import type {
+  HyperframeLintFinding,
+  HyperframeLintResult,
+  HyperframeLinterOptions,
+} from "./types.js";
 import type { ParsableDocumentLike } from "@hyperframes/parsers/sub-composition-validity";
+import { isAudibleVideoTag, mediaSrcOf, mediaSrcTagRe, readAttr, readDecodedAttr } from "./utils";
 
 /** Adapts linkedom's `parseHTML` to the `checkSubCompositionUsability` contract. */
 function parseSubCompHtml(html: string): ParsableDocumentLike {
   return parseHTML(html).document as unknown as ParsableDocumentLike;
 }
+
+/** The file a source was read from, as per-file findings carry it. */
+const sourceFile = (projectDir: string, compSrcPath?: string) =>
+  resolve(projectDir, compSrcPath ?? "index.html");
 
 interface HtmlSource {
   html: string;
@@ -24,139 +50,114 @@ interface CssSource {
   rootRelativePath?: string;
 }
 
+/** Linkedom keeps template contents in a DocumentFragment that is not part of
+ * the document query tree. Lint rules must still see shell styles and links
+ * inside templates, so walk each template's content recursively without
+ * falling back to regex parsing. */
+function querySelectorAllIncludingTemplates(root: ParentNode, selector: string): Element[] {
+  const matches: Element[] = [...root.querySelectorAll(selector)];
+  for (const template of root.querySelectorAll("template")) {
+    const content = (template as HTMLTemplateElement).content;
+    if (content) matches.push(...querySelectorAllIncludingTemplates(content, selector));
+  }
+  return matches;
+}
+
 export interface ProjectLintResult {
-  results: Array<{ file: string; result: HyperframeLintResult }>;
+  results: Array<{ file: string; result: HyperframeLintResult; contentHash: string }>;
   totalErrors: number;
   totalWarnings: number;
   totalInfos: number;
 }
 
+/**
+ * Short content digest of a linted file. Callers use it to tell "the author
+ * edited this file and the finding survived" (an iteration that did not
+ * converge) from "the same file was linted twice" (no attempt was made).
+ * Truncated because it is only ever compared against the previous run's digest
+ * for the same file, never used as a security boundary.
+ */
+function contentDigest(html: string): string {
+  return createHash("sha256").update(html).digest("hex").slice(0, 16);
+}
+
 const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".aac", ".ogg", ".m4a", ".flac", ".opus"]);
-const STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
-const OPEN_TAG_RE = /<([a-z][\w:-]*)(\s[^<>]*?)?>/gi;
 const MASK_IMAGE_URL_RE =
   /\b(?:-webkit-)?mask-image\s*:\s*[^;{}]*url\(\s*(?:"([^"]+)"|'([^']+)'|([^"')\s]+))\s*\)/gi;
 
-function readHtmlAttr(tag: string, name: string): string | null {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = tag.match(new RegExp(`\\b${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
-  return match?.[1] ?? match?.[2] ?? null;
-}
-
 function isLocalStylesheetHref(href: string): boolean {
   return !!href && !/^(https?:|data:|blob:|\/\/)/i.test(href);
+}
+
+function staysInsideProjectRoot(href: string): boolean {
+  return !href.startsWith("/") && !href.split("/").includes("..");
+}
+
+function collectLocalStylesheets(
+  projectDir: string,
+  document: ParentNode,
+  compSrcPath?: string,
+): Array<{ href: string; content: string; rootRelativePath: string }> {
+  const styles: Array<{ href: string; content: string; rootRelativePath: string }> = [];
+  for (const link of querySelectorAllIncludingTemplates(document, "link")) {
+    const rel = link.getAttribute("rel") ?? "";
+    if (!rel.split(/\s+/).some((part) => part.toLowerCase() === "stylesheet")) continue;
+    const href = link.getAttribute("href") ?? "";
+    if (!isLocalStylesheetHref(href)) continue;
+    const besideFile = compSrcPath ? join(dirname(compSrcPath), href) : href;
+    const stylesheet =
+      resolveExistingLocalAsset(projectDir, besideFile) ??
+      (compSrcPath && staysInsideProjectRoot(href)
+        ? resolveExistingLocalAsset(projectDir, href)
+        : null);
+    if (!stylesheet) continue;
+    const read = readProjectFile(stylesheet.resolved);
+    if (read.kind !== "file") continue;
+    styles.push({ href, content: read.text, rootRelativePath: stylesheet.rootRelativePath });
+  }
+  return styles;
 }
 
 function collectExternalStyles(
   projectDir: string,
   html: string,
   compSrcPath?: string,
-): Array<{ href: string; content: string }> {
-  const styles: Array<{ href: string; content: string }> = [];
-  const linkRe = /<link\b[^>]*>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = linkRe.exec(html)) !== null) {
-    const tag = match[0];
-    const rel = tag.match(/\brel\s*=\s*["']([^"']+)["']/i)?.[1] ?? "";
-    if (!rel.split(/\s+/).some((part) => part.toLowerCase() === "stylesheet")) continue;
-    const href = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1] ?? "";
-    if (!isLocalStylesheetHref(href)) continue;
-    const rootRelative = compSrcPath ? join(dirname(compSrcPath), href) : href;
-    const stylesheet = resolveExistingLocalAsset(projectDir, rootRelative);
-    if (!stylesheet) continue;
-    styles.push({ href, content: readFileSync(stylesheet.resolved, "utf-8") });
+): NonNullable<HyperframeLinterOptions["externalStyles"]> {
+  const styles: NonNullable<HyperframeLinterOptions["externalStyles"]> = [];
+  const { document } = parseHTML(html);
+  for (const { href, content, rootRelativePath } of collectLocalStylesheets(
+    projectDir,
+    document,
+    compSrcPath,
+  )) {
+    styles.push({ href, content, file: join(projectDir, rootRelativePath), rootRelativePath });
   }
   return styles;
 }
 
 function collectCssSources(projectDir: string, html: string, compSrcPath?: string): CssSource[] {
   const sources: CssSource[] = [];
+  const { document } = parseHTML(html);
 
-  let styleMatch: RegExpExecArray | null;
-  const stylePattern = new RegExp(STYLE_BLOCK_RE.source, STYLE_BLOCK_RE.flags);
-  while ((styleMatch = stylePattern.exec(html)) !== null) {
-    sources.push({ content: styleMatch[1] ?? "" });
+  for (const style of querySelectorAllIncludingTemplates(document, "style")) {
+    sources.push({ content: style.textContent ?? "" });
   }
 
-  const linkRe = /<link\b[^>]*>/gi;
-  let linkMatch: RegExpExecArray | null;
-  while ((linkMatch = linkRe.exec(html)) !== null) {
-    const tag = linkMatch[0];
-    const rel = readHtmlAttr(tag, "rel") ?? "";
-    if (!rel.split(/\s+/).some((part) => part.toLowerCase() === "stylesheet")) continue;
-    const href = readHtmlAttr(tag, "href") ?? "";
-    if (!isLocalStylesheetHref(href)) continue;
-
-    const rootRelativePath = compSrcPath ? join(dirname(compSrcPath), href) : href;
-    const stylesheet = resolveExistingLocalAsset(projectDir, rootRelativePath);
-    if (!stylesheet) continue;
-    sources.push({
-      content: readFileSync(stylesheet.resolved, "utf-8"),
-      rootRelativePath: stylesheet.rootRelativePath,
-    });
+  for (const { content, rootRelativePath } of collectLocalStylesheets(
+    projectDir,
+    document,
+    compSrcPath,
+  )) {
+    sources.push({ content, rootRelativePath });
   }
 
-  let tagMatch: RegExpExecArray | null;
-  const tagPattern = new RegExp(OPEN_TAG_RE.source, OPEN_TAG_RE.flags);
-  while ((tagMatch = tagPattern.exec(html)) !== null) {
-    const tag = tagMatch[0];
-    const style = readHtmlAttr(tag, "style");
+  for (const element of querySelectorAllIncludingTemplates(document, "[style]")) {
+    const style = element.getAttribute("style");
     if (!style) continue;
     sources.push({ content: style });
   }
 
   return sources;
-}
-
-function isRemoteOrInlineUrl(url: string): boolean {
-  return /^(https?:|data:|blob:|\/\/|#)/i.test(url);
-}
-
-function cleanAssetUrl(url: string): string {
-  return url.trim().split(/[?#]/, 1)[0] ?? "";
-}
-
-function isWithinProjectRoot(projectDir: string, candidate: string): boolean {
-  const projectRoot = resolve(projectDir);
-  const relativePath = relative(projectRoot, candidate);
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
-}
-
-function addCandidate(candidates: string[], candidate: string): void {
-  if (!candidates.includes(candidate)) candidates.push(candidate);
-}
-
-function resolveLocalAssetCandidates(projectDir: string, url: string): string[] {
-  const cleanUrl = cleanAssetUrl(url);
-  const projectRoot = resolve(projectDir);
-  const candidates: string[] = [];
-
-  for (const variant of decodeUrlPathVariants(cleanUrl)) {
-    const projectRelative = variant.startsWith("/") ? variant.slice(1) : variant;
-    const resolved = resolve(projectRoot, projectRelative);
-    if (isWithinProjectRoot(projectRoot, resolved)) {
-      addCandidate(candidates, resolved);
-      continue;
-    }
-
-    const normalized = posix.normalize(projectRelative.replace(/\\/g, "/"));
-    const clamped = normalized.replace(/^(\.\.\/)+/, "");
-    if (clamped && !clamped.startsWith("..")) {
-      addCandidate(candidates, resolve(projectRoot, clamped));
-    }
-  }
-
-  return candidates;
-}
-
-function resolveExistingLocalAsset(
-  projectDir: string,
-  url: string,
-): { resolved: string; rootRelativePath: string } | null {
-  const projectRoot = resolve(projectDir);
-  const resolved = resolveLocalAssetCandidates(projectRoot, url).find(existsSync);
-  if (!resolved) return null;
-  return { resolved, rootRelativePath: relative(projectRoot, resolved) };
 }
 
 function resolveCssAssetCandidates(
@@ -170,37 +171,58 @@ function resolveCssAssetCandidates(
     return resolveLocalAssetCandidates(projectDir, join(dirname(cssRootRelativePath), url));
   }
   if (htmlCompSrcPath) {
-    return resolveLocalAssetCandidates(projectDir, rewriteAssetPath(htmlCompSrcPath, url));
+    return resolveLocalAssetCandidates(
+      projectDir,
+      rewriteAssetPath(htmlCompSrcPath, url, (path) => existsSync(join(projectDir, path))),
+    );
   }
   return resolveLocalAssetCandidates(projectDir, url);
 }
 
-export async function lintProject(projectDir: string): Promise<ProjectLintResult> {
-  const indexPath = resolve(projectDir, "index.html");
-  const results: Array<{ file: string; result: HyperframeLintResult }> = [];
+export async function lintProject(
+  projectDir: string,
+  entryFile?: string,
+  hostOptions: Pick<HyperframeLinterOptions, "host"> = {},
+): Promise<ProjectLintResult> {
+  const indexPath = entryFile ? resolve(entryFile) : resolve(projectDir, "index.html");
+  if (entryFile && !isWithinProjectRoot(projectDir, indexPath)) {
+    throw new Error(`Explicit lint entry is outside the project directory: ${entryFile}`);
+  }
+  const rootFile = relative(resolve(projectDir), indexPath).replace(/\\/g, "/") || "index.html";
+  const rootCompSrcPath = rootFile === "index.html" ? undefined : rootFile;
+  const results: ProjectLintResult["results"] = [];
   let totalErrors = 0;
   let totalWarnings = 0;
   let totalInfos = 0;
 
   const rootHtml = readFileSync(indexPath, "utf-8");
   const rootResult = await lintHyperframeHtml(rootHtml, {
+    ...hostOptions,
     filePath: indexPath,
-    externalStyles: collectExternalStyles(projectDir, rootHtml),
+    compSrcPath: rootFile,
+    externalStyles: collectExternalStyles(projectDir, rootHtml, rootCompSrcPath),
   });
-  results.push({ file: "index.html", result: rootResult });
+  results.push({ file: rootFile, result: rootResult, contentHash: contentDigest(rootHtml) });
   totalErrors += rootResult.errorCount;
   totalWarnings += rootResult.warningCount;
   totalInfos += rootResult.infoCount;
 
-  const allHtmlSources: HtmlSource[] = [{ html: rootHtml }];
+  const allHtmlSources: HtmlSource[] = [{ html: rootHtml, compSrcPath: rootCompSrcPath }];
   const compositionsDir = resolve(projectDir, "compositions");
-  if (existsSync(compositionsDir)) {
+  if (!entryFile && existsSync(compositionsDir)) {
     const collectHtmlFiles = (dir: string, rel: string): string[] => {
       const out: string[] = [];
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) out.push(...collectHtmlFiles(join(dir, entry.name), relPath));
-        else if (entry.isFile() && entry.name.endsWith(".html")) out.push(relPath);
+        if (entry.isDirectory()) {
+          // Registry components are source snippets, not independently mounted
+          // sub-compositions. Linting every installed template here makes an
+          // unused component fail the assembled project check.
+          if (!rel && entry.name === "components") continue;
+          out.push(...collectHtmlFiles(join(dir, entry.name), relPath));
+        } else if (entry.isFile() && entry.name.endsWith(".html") && !entry.name.startsWith("._")) {
+          out.push(relPath);
+        }
       }
       return out;
     };
@@ -210,12 +232,23 @@ export async function lintProject(projectDir: string): Promise<ProjectLintResult
       const html = readFileSync(filePath, "utf-8");
       const compSrcPath = `compositions/${file}`;
       allHtmlSources.push({ html, compSrcPath });
+      // Mountable fragments (figma component imports, registry snippets) are
+      // not standalone compositions — composition-root rules don't apply.
+      // Anchored to the file's ROOT element so a real composition that merely
+      // inlines snippet markup (or mentions the token in text) is still linted.
+      if (isSnippetFragment(html)) continue;
       const result = await lintHyperframeHtml(html, {
+        ...hostOptions,
         filePath,
         isSubComposition: true,
+        compSrcPath,
         externalStyles: collectExternalStyles(projectDir, html, compSrcPath),
       });
-      results.push({ file: `compositions/${file}`, result });
+      results.push({
+        file: `compositions/${file}`,
+        result,
+        contentHash: contentDigest(html),
+      });
       totalErrors += result.errorCount;
       totalWarnings += result.warningCount;
       totalInfos += result.infoCount;
@@ -227,28 +260,73 @@ export async function lintProject(projectDir: string): Promise<ProjectLintResult
     ...lintAudioSrcNotFound(projectDir, allHtmlSources),
     ...lintMissingLocalAsset(projectDir, allHtmlSources),
     ...lintTextureMaskAssetNotFound(projectDir, allHtmlSources),
-    ...lintMultipleRootCompositions(projectDir),
+    ...(!entryFile ? lintMultipleRootCompositions(projectDir) : []),
+    ...(!entryFile ? lintBlankRootWithStandaloneComposition(rootHtml, allHtmlSources) : []),
     ...lintDuplicateAudioTracks(allHtmlSources),
     ...lintMissingOrEmptySubComposition(projectDir, rootHtml),
+    ...(await lintVideoMediaStartPastEof(projectDir, allHtmlSources)),
+    ...(await lintHevcPreviewCodec(collectLocalVideoCandidates(projectDir, allHtmlSources))),
   ];
-  if (projectFindings.length > 0) {
-    for (const finding of projectFindings) {
-      rootResult.findings.push(finding);
-      if (finding.severity === "error") {
-        rootResult.errorCount++;
-        rootResult.ok = false;
-        totalErrors++;
-      } else if (finding.severity === "warning") {
-        rootResult.warningCount++;
-        totalWarnings++;
-      } else {
-        rootResult.infoCount++;
-        totalInfos++;
-      }
+  for (const finding of projectFindings) {
+    const ownFile = finding.file && resolve(projectDir, finding.file);
+    const owner =
+      results.find((entry) => resolve(projectDir, entry.file) === ownFile)?.result ?? rootResult;
+    owner.findings.push(finding);
+    if (finding.severity === "error") {
+      owner.errorCount++;
+      owner.ok = false;
+      totalErrors++;
+    } else if (finding.severity === "warning") {
+      owner.warningCount++;
+      totalWarnings++;
+    } else {
+      owner.infoCount++;
+      totalInfos++;
     }
   }
 
   return { results, totalErrors, totalWarnings, totalInfos };
+}
+
+function lintBlankRootWithStandaloneComposition(
+  rootHtml: string,
+  htmlSources: HtmlSource[],
+): HyperframeLintFinding[] {
+  const { document: rootDocument } = parseHTML(rootHtml);
+  const root = rootDocument.querySelector("body [data-composition-id]");
+  // A no-media scaffold has no rendered descendants and can silently mask an authored file below.
+  // A scaffold that retained its A-roll <video>/<audio> is visibly non-blank, so this rule leaves it
+  // alone even when another composition is unmounted.
+  if (!root || root.querySelector("*:not(script):not(style):not(link):not(meta):not(template)")) {
+    return [];
+  }
+
+  const standaloneCandidates: string[] = [];
+  for (const source of htmlSources) {
+    if (!source.compSrcPath) continue;
+    const { document } = parseHTML(source.html);
+    const composition = document.querySelector("body [data-composition-id]");
+    if (!composition) continue;
+    const authoredTimedContent = Array.from(
+      composition.querySelectorAll(
+        ".clip, [data-start], [data-end], video, audio, img, svg, canvas",
+      ),
+    ).some((element) => !element.hasAttribute("data-composition-src"));
+    if (authoredTimedContent) standaloneCandidates.push(source.compSrcPath);
+  }
+
+  if (standaloneCandidates.length === 0) return [];
+  return [
+    {
+      code: "blank_root_with_standalone_composition",
+      severity: "error",
+      message: `The default index.html composition has no renderable content, but ${standaloneCandidates.join(", ")} contains a standalone timed composition. Default check, snapshot, preview, render, and publish commands open index.html, so they will capture or publish only its background.`,
+      fixHint:
+        `Move the authored composition into index.html, or mount it from index.html with data-composition-src and the sub-composition <template> contract. ` +
+        `If the separate file is intentional, render it explicitly with --composition ${standaloneCandidates[0]}.`,
+      suggestedComposition: standaloneCandidates[0],
+    },
+  ];
 }
 
 function lintProjectAudioFiles(
@@ -269,8 +347,11 @@ function lintProjectAudioFiles(
   if (audioFiles.length === 0) return findings;
 
   const hasAudioElement = htmlSources.some(({ html }) => /<audio\b/i.test(html));
+  const hasAudibleVideo = htmlSources.some(({ html }) =>
+    (html.match(/<video\b[^>]*>/gi) ?? []).some(isAudibleVideoTag),
+  );
 
-  if (!hasAudioElement) {
+  if (!hasAudioElement && !hasAudibleVideo) {
     findings.push({
       code: "audio_file_without_element",
       severity: "warning",
@@ -291,27 +372,32 @@ function lintAudioSrcNotFound(
 ): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
 
-  const audioSrcRe = /<audio\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const audioSrcRe = mediaSrcTagRe("audio");
 
-  const missingSrcs: string[] = [];
+  const missingByFile = new Map<string, Set<string>>();
   for (const { html, compSrcPath } of htmlSources) {
+    const scannable = maskNonScannableRanges(html);
     let match: RegExpExecArray | null;
-    while ((match = audioSrcRe.exec(html)) !== null) {
-      const src = match[1]!;
+    while ((match = audioSrcRe.exec(scannable)) !== null) {
+      const src = mediaSrcOf(match);
       if (/^(https?:|data:|blob:)/i.test(src)) continue;
-      if (/^__[A-Z_]+__$/.test(src)) continue;
-      const rootRelative = compSrcPath ? rewriteAssetPath(compSrcPath, src) : src;
-      if (!resolveLocalAssetCandidates(projectDir, rootRelative).some(existsSync)) {
-        missingSrcs.push(src);
+      if (isUnresolvedAssetPlaceholder(src)) continue;
+      const rootRelative = compSrcPath
+        ? rewriteAssetPath(compSrcPath, src, (path) => existsSync(join(projectDir, path)))
+        : src;
+      if (!existsSync(resolveProjectRelativeSrc(rootRelative, projectDir))) {
+        const file = sourceFile(projectDir, compSrcPath);
+        missingByFile.set(file, (missingByFile.get(file) ?? new Set()).add(src));
       }
     }
   }
 
-  if (missingSrcs.length > 0) {
-    const unique = [...new Set(missingSrcs)];
+  for (const [file, srcs] of missingByFile) {
+    const unique = [...srcs];
     findings.push({
       code: "audio_src_not_found",
       severity: "error",
+      file,
       message: `<audio> element references file(s) not found in the project: ${unique.join(", ")}. The rendered video will be silent.`,
       fixHint:
         unique.length === 1
@@ -323,17 +409,6 @@ function lintAudioSrcNotFound(
   return findings;
 }
 
-function maskRange(src: string, pattern: RegExp): string {
-  return src.replace(pattern, (m) => " ".repeat(m.length));
-}
-
-function maskNonScannableRanges(html: string): string {
-  let out = maskRange(html, /<!--[\s\S]*?-->/g);
-  out = maskRange(out, /<style\b[^>]*>[\s\S]*?<\/style\b[^>]*>/gi);
-  out = maskRange(out, /<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi);
-  return out;
-}
-
 // fallow-ignore-next-line complexity
 function lintMissingLocalAsset(
   projectDir: string,
@@ -341,9 +416,12 @@ function lintMissingLocalAsset(
 ): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
 
-  const localAssetSrcRe = /<(video|img|source)\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const localAssetSrcRe = mediaSrcTagRe("video|img|source");
 
-  const missingByTag = new Map<string, Map<string, string>>();
+  const missingByTag = new Map<
+    string,
+    { file: string; tagName: string; byResolved: Map<string, string> }
+  >();
 
   for (const { html, compSrcPath } of htmlSources) {
     const scannable = maskNonScannableRanges(html);
@@ -351,30 +429,36 @@ function lintMissingLocalAsset(
     let match: RegExpExecArray | null;
     while ((match = re.exec(scannable)) !== null) {
       const tagName = (match[1] ?? "").toLowerCase();
-      const rawSrc = match[2] ?? "";
+      const rawSrc = mediaSrcOf(match);
+      // Placeholder check runs on the RAW value: cleanAssetUrl() splits on ?/# and would chop inside a ${...} token.
+      if (isUnresolvedAssetPlaceholder(rawSrc)) continue;
       const src = cleanAssetUrl(rawSrc);
       if (!src) continue;
       if (isRemoteOrInlineUrl(src)) continue;
-      if (/^__[A-Z_]+__$/.test(src)) continue;
-      const rootRelative = compSrcPath ? rewriteAssetPath(compSrcPath, src) : src;
+      const rootRelative = compSrcPath
+        ? rewriteAssetPath(compSrcPath, src, (path) => existsSync(join(projectDir, path)))
+        : src;
       const resolvedAsset = resolveExistingLocalAsset(projectDir, rootRelative);
       if (resolvedAsset) continue;
 
       const resolvedKey = resolve(projectDir, rootRelative);
-      let bucket = missingByTag.get(tagName);
+      const file = sourceFile(projectDir, compSrcPath);
+      const bucketKey = `${file}\0${tagName}`;
+      let bucket = missingByTag.get(bucketKey);
       if (!bucket) {
-        bucket = new Map<string, string>();
-        missingByTag.set(tagName, bucket);
+        bucket = { file, tagName, byResolved: new Map<string, string>() };
+        missingByTag.set(bucketKey, bucket);
       }
-      if (!bucket.has(resolvedKey)) bucket.set(resolvedKey, src);
+      if (!bucket.byResolved.has(resolvedKey)) bucket.byResolved.set(resolvedKey, src);
     }
   }
 
-  for (const [tagName, byResolved] of missingByTag) {
+  for (const { file, tagName, byResolved } of missingByTag.values()) {
     const unique = [...byResolved.values()];
     findings.push({
       code: "missing_local_asset",
       severity: "error",
+      file,
       message:
         `<${tagName}> element references local file(s) not found in the project: ${unique.join(", ")}. ` +
         "The renderer will silently skip these and produce a video with missing visuals.",
@@ -384,7 +468,7 @@ function lintMissingLocalAsset(
             "Common cause: captured asset filenames are unreliable (heygen-logo.svg often contains Google, nvidia-logo.svg may contain Autodesk, etc.). " +
             "Open the contact sheets and verify the file actually exists at this path before referencing it."
           : "Add the missing files to the project directory, or update the src attributes to point to existing files. " +
-            "Captured asset filenames are unreliable — verify against capture/contact-sheets/ and capture/extracted/asset-descriptions.md.",
+            "Captured asset filenames are unreliable. Verify against capture/contact-sheets/ and capture/extracted/asset-descriptions.md.",
     });
   }
 
@@ -395,17 +479,19 @@ function lintTextureMaskAssetNotFound(
   projectDir: string,
   htmlSources: HtmlSource[],
 ): HyperframeLintFinding[] {
-  const missing = new Map<string, string>();
+  const missingByFile = new Map<string, Set<string>>();
 
   for (const { html, compSrcPath } of htmlSources) {
+    const file = sourceFile(projectDir, compSrcPath);
     for (const cssSource of collectCssSources(projectDir, html, compSrcPath)) {
       let match: RegExpExecArray | null;
       const pattern = new RegExp(MASK_IMAGE_URL_RE.source, MASK_IMAGE_URL_RE.flags);
       while ((match = pattern.exec(cssSource.content)) !== null) {
         const rawUrl = match[1] ?? match[2] ?? match[3] ?? "";
+        // Placeholder check runs on the RAW value: cleanAssetUrl() splits on ?/# and would chop inside a ${...} token.
+        if (isUnresolvedAssetPlaceholder(rawUrl)) continue;
         const url = cleanAssetUrl(rawUrl);
         if (!url || isRemoteOrInlineUrl(url)) continue;
-        if (/^__[A-Z_]+__$/.test(url)) continue;
 
         const candidates = resolveCssAssetCandidates(
           projectDir,
@@ -414,30 +500,32 @@ function lintTextureMaskAssetNotFound(
           cssSource.rootRelativePath,
         );
         if (candidates.some(existsSync)) continue;
-        missing.set(url, candidates[0] ?? resolve(projectDir, url));
+        missingByFile.set(file, (missingByFile.get(file) ?? new Set()).add(url));
       }
     }
   }
 
-  if (missing.size === 0) return [];
-  const urls = [...missing.keys()];
-  return [
-    {
+  return [...missingByFile].map(([file, found]): HyperframeLintFinding => {
+    const urls = [...found];
+    return {
       code: "texture_mask_asset_not_found",
       severity: "error",
+      file,
       message: `CSS mask-image references file(s) not found in the project: ${urls.join(", ")}.`,
       fixHint:
         urls.length === 1
           ? `Add "${urls[0]}" to the project, or update the mask-image URL to point to an existing texture mask.`
           : "Add the missing texture mask files to the project, or update the mask-image URLs to point to existing files.",
-    },
-  ];
+    };
+  });
 }
 
 function lintMultipleRootCompositions(projectDir: string): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
   try {
-    const rootHtmlFiles = readdirSync(projectDir).filter((f) => f.endsWith(".html"));
+    const rootHtmlFiles = readdirSync(projectDir).filter(
+      (file) => file.endsWith(".html") && !file.startsWith("._"),
+    );
     const rootCompositions: string[] = [];
     for (const file of rootHtmlFiles) {
       if (file === "caption-skin.html") continue;
@@ -463,24 +551,19 @@ function lintMultipleRootCompositions(projectDir: string): HyperframeLintFinding
 
 function lintDuplicateAudioTracks(htmlSources: HtmlSource[]): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
-  function extractAttr(tag: string, name: string): string | null {
-    const re = new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i");
-    const m = tag.match(re);
-    return m?.[1] ?? null;
-  }
-
   const tracks: Array<{ trackIndex: number; start: number; end: number; src: string }> = [];
   const seen = new Set<string>();
 
   for (const { html } of htmlSources) {
-    const audioTagRe = /<audio\b[^>]*>/gi;
+    const soundTagRe = /<(?:audio|video)\b[^>]*>/gi;
     let match: RegExpExecArray | null;
-    while ((match = audioTagRe.exec(html)) !== null) {
+    while ((match = soundTagRe.exec(html)) !== null) {
       const tag = match[0];
-      const trackStr = extractAttr(tag, "data-track-index");
-      const startStr = extractAttr(tag, "data-start");
-      const durStr = extractAttr(tag, "data-duration");
-      const src = extractAttr(tag, "src") ?? "unknown";
+      if (/^<video/i.test(tag) && !isAudibleVideoTag(tag)) continue;
+      const trackStr = readAttr(tag, "data-track-index");
+      const startStr = readAttr(tag, "data-start");
+      const durStr = readAttr(tag, "data-duration");
+      const src = readDecodedAttr(tag, "src") || "unknown";
       if (!trackStr || !startStr) continue;
 
       const trackIndex = parseInt(trackStr, 10);
@@ -503,7 +586,7 @@ function lintDuplicateAudioTracks(htmlSources: HtmlSource[]): HyperframeLintFind
         findings.push({
           code: "duplicate_audio_track",
           severity: "warning",
-          message: `Multiple <audio> elements on track ${a.trackIndex} overlap (${a.src} at ${a.start}-${Number.isFinite(a.end) ? a.end.toFixed(1) : "end"}s, ${b.src} at ${b.start}-${Number.isFinite(b.end) ? b.end.toFixed(1) : "end"}s). This causes layered audio playback.`,
+          message: `Multiple audible <audio>/<video> elements on track ${a.trackIndex} overlap (${a.src} at ${a.start}-${Number.isFinite(a.end) ? a.end.toFixed(1) : "end"}s, ${b.src} at ${b.start}-${Number.isFinite(b.end) ? b.end.toFixed(1) : "end"}s). This causes layered audio playback.`,
           fixHint: "Use non-overlapping time windows or different track indices.",
         });
       }
@@ -540,19 +623,14 @@ function lintMissingOrEmptySubComposition(
   rootHtml: string,
 ): HyperframeLintFinding[] {
   // Dedup by src path — the same reference can appear from nested sub-comps.
-  const checked = new Map<string, { srcPath: string; problem: string }>();
+  const checked = new Map<string, { srcPath: string; problem: string; folder?: true }>();
   const visited = new Set<string>();
 
   // fallow-ignore-next-line complexity
   const walk = (html: string): void => {
-    const compositionSrcRe = /<[^>]*\bdata-composition-src\s*=\s*["']([^"']+)["'][^>]*>/gi;
-    const scannable = maskNonScannableRanges(html);
-    let match: RegExpExecArray | null;
-    while ((match = compositionSrcRe.exec(scannable)) !== null) {
-      const srcPath = (match[1] ?? "").trim();
-      if (!srcPath) continue;
-      if (/^__[A-Z_]+__$/.test(srcPath)) continue; // template placeholder
-
+    // Shared scanner — see collectSubCompositionSrcs for why this must be a
+    // text scan rather than a DOM query (template content is inert).
+    for (const srcPath of collectSubCompositionSrcs(html)) {
       // data-composition-src is always written root-relative (even from a
       // nested sub-composition) — matches the resolution the renderer uses
       // in packages/producer/src/services/htmlCompiler.ts (parseSubCompositions
@@ -566,14 +644,25 @@ function lintMissingOrEmptySubComposition(
       if (visited.has(filePath)) continue;
       visited.add(filePath);
 
-      if (!existsSync(filePath)) {
+      const read = readProjectFile(filePath);
+      if (read.kind === "missing") {
         if (!checked.has(srcPath)) {
           checked.set(srcPath, { srcPath, problem: "the file does not exist" });
         }
         continue;
       }
+      if (read.kind === "folder") {
+        if (!checked.has(srcPath)) {
+          checked.set(srcPath, {
+            srcPath,
+            problem: "it is a folder, not an HTML file",
+            folder: true,
+          });
+        }
+        continue;
+      }
 
-      const fileHtml = readFileSync(filePath, "utf-8");
+      const fileHtml = read.text;
       const validity = checkSubCompositionUsability(fileHtml, parseSubCompHtml);
       if (!validity.ok) {
         if (!checked.has(srcPath)) {
@@ -594,19 +683,28 @@ function lintMissingOrEmptySubComposition(
   walk(rootHtml);
 
   const findings: HyperframeLintFinding[] = [];
-  for (const { srcPath, problem } of checked.values()) {
+  for (const { srcPath, problem, folder } of checked.values()) {
     findings.push({
       code: "missing_or_empty_sub_composition",
       severity: "error",
       message: `data-composition-src references "${srcPath}", but ${problem}.`,
-      fixHint:
-        `Fix this before rendering — the render pre-flight rejects unusable sub-compositions. ` +
-        `Write valid HTML into "${srcPath}" — it needs a <template> or <body> containing an element with ` +
-        `data-composition-id, data-width, and data-height. Preview/studio still tolerates and skips the ` +
-        "scene while you author it. If a scene-authoring step is still running, wait for it to finish " +
-        "before referencing the file, or re-run the step that generates it.",
+      fixHint: folder
+        ? `Point data-composition-src at the HTML file inside the folder, such as "${srcPath}/index.html".`
+        : `Fix this before rendering: the render pre-flight rejects unusable sub-compositions. ` +
+          `Write valid HTML into "${srcPath}". It needs a <template> or <body> containing an element with ` +
+          `data-composition-id, data-width, and data-height. Preview/studio still tolerates and skips the ` +
+          "scene while you author it. If a scene-authoring step is still running, wait for it to finish " +
+          "before referencing the file, or re-run the step that generates it.",
     });
   }
 
   return findings;
+}
+
+/** True when the file's first element carries data-hf-snippet — i.e. the file
+ * IS a mountable fragment, not a composition that merely contains one. */
+function isSnippetFragment(html: string): boolean {
+  const firstTag = html.match(/<[a-zA-Z][^>]*>/);
+  if (!firstTag) return false;
+  return /\bdata-hf-snippet\b/.test(firstTag[0]);
 }

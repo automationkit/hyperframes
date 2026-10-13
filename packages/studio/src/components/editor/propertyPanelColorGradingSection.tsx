@@ -1,105 +1,61 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-  type RefObject,
-} from "react";
-import {
-  HF_COLOR_GRADING_ATTR,
-  HF_COLOR_GRADING_COLOR_SPACE,
-  isHfColorGradingActive,
-  normalizeHfColorGrading,
-  serializeHfColorGrading,
-  type HfColorGradingAdjustKey,
-  type HfColorGradingTarget,
-  type NormalizedHfColorGrading,
-} from "@hyperframes/core/color-grading";
+import { type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { isHfColorGradingActive } from "@hyperframes/core/color-grading";
 import { Compare, Palette, RotateCcw } from "../../icons/SystemIcons";
 import type { DomEditSelection } from "./domEditing";
 import { ColorGradingControls } from "./propertyPanelColorGradingControls";
 import { Section } from "./propertyPanelPrimitives";
-
-const DEFAULT_ADJUST: Record<HfColorGradingAdjustKey, number> = {
-  exposure: 0,
-  contrast: 0,
-  highlights: 0,
-  shadows: 0,
-  whites: 0,
-  blacks: 0,
-  temperature: 0,
-  tint: 0,
-  saturation: 0,
-};
-
-const DEFAULT_COLOR_GRADING: NormalizedHfColorGrading = {
-  enabled: true,
-  preset: "neutral",
-  intensity: 1,
-  adjust: DEFAULT_ADJUST,
-  lut: null,
-  colorSpace: HF_COLOR_GRADING_COLOR_SPACE,
-};
-
-const COLOR_GRADING_DATA_KEY = HF_COLOR_GRADING_ATTR.replace(/^data-/, "");
-
-interface RuntimeColorGradingStatus {
-  state: "missing" | "inactive" | "pending" | "active" | "unavailable";
-  message: string;
-}
-
-function readColorGradingFromElement(element: DomEditSelection): NormalizedHfColorGrading {
-  const grading =
-    normalizeHfColorGrading(element.dataAttributes[COLOR_GRADING_DATA_KEY]) ??
-    DEFAULT_COLOR_GRADING;
-  return { ...grading, intensity: 1 };
-}
-
-function toBridgeColorGrading(grading: NormalizedHfColorGrading): unknown {
-  if (!isHfColorGradingActive(grading)) return null;
-  const { enabled: _enabled, ...bridgeGrading } = grading;
-  return bridgeGrading;
-}
-
-function readRuntimeColorGradingStatus(
-  iframe: HTMLIFrameElement | null | undefined,
-  target: HfColorGradingTarget,
-): RuntimeColorGradingStatus {
-  try {
-    const win = iframe?.contentWindow as
-      | (Window & {
-          __hf?: {
-            colorGrading?: {
-              getStatus?: (
-                target: HfColorGradingTarget | string | null | undefined,
-              ) => RuntimeColorGradingStatus;
-            };
-          };
-        })
-      | null
-      | undefined;
-    const status = win?.__hf?.colorGrading?.getStatus?.(target);
-    return status ?? { state: "pending", message: "Waiting for runtime" };
-  } catch {
-    return { state: "unavailable", message: "Preview unavailable" };
-  }
-}
+import {
+  useColorGradingController,
+  type MediaMetadata,
+  type RuntimeColorGradingStatus,
+} from "./useColorGradingController";
+import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 
 function StatusPill({ status }: { status: RuntimeColorGradingStatus }) {
   const dotClass =
     status.state === "active"
-      ? "bg-emerald-400"
+      ? "bg-accent"
       : status.state === "pending"
-        ? "bg-amber-300"
+        ? "bg-warning-ink"
         : status.state === "unavailable"
-          ? "bg-red-400"
+          ? "bg-danger-ink"
           : "bg-panel-text-5";
   return (
-    <div className="flex min-w-0 items-center gap-1.5 rounded bg-panel-input px-2 py-1 text-[10px] font-medium text-panel-text-3">
-      <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${dotClass}`} />
+    <div
+      className="flex min-w-0 items-center gap-1.5 rounded-sm bg-panel-input px-2 py-1 text-[10px] font-medium text-panel-text-3"
+      title={status.message}
+    >
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} />
       <span className="truncate">{status.message}</span>
+    </div>
+  );
+}
+
+function HdrMediaWarning({ metadata }: { metadata: MediaMetadata | null }) {
+  if (metadata?.color.dynamicRange !== "hdr") return null;
+  const details = [
+    metadata.color.codecName,
+    metadata.color.profile,
+    metadata.color.pixelFormat,
+    metadata.color.colorPrimaries,
+    metadata.color.colorTransfer,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-4 text-warning-ink">
+      <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
+        <span className="font-semibold">{metadata.color.label} source</span>
+        <span className="rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-warning-ink">
+          SDR preview
+        </span>
+      </div>
+      <p className="text-text-2">
+        These controls use the current SDR shader preview path. Render may stay HDR-tagged, but this
+        is not true HDR color grading yet.
+      </p>
+      {details && <p className="mt-1 truncate text-[10px] text-text-muted">{details}</p>}
     </div>
   );
 }
@@ -113,10 +69,12 @@ function HoldBeforeButton({
   disabled: boolean;
   onHoldChange: (holding: boolean) => void;
 }) {
+  const track = useTrackDesignInput();
   const startHold = (event: ReactPointerEvent<HTMLButtonElement>) => {
     if (disabled) return;
     event.preventDefault();
     event.stopPropagation();
+    track("toggle", "Compare original");
     onHoldChange(true);
     const release = () => {
       onHoldChange(false);
@@ -150,16 +108,19 @@ function HoldBeforeButton({
       onKeyDown={(event) => {
         if (disabled || (event.key !== " " && event.key !== "Enter")) return;
         event.preventDefault();
-        if (!active) onHoldChange(true);
+        if (!active) {
+          track("toggle", "Compare original");
+          onHoldChange(true);
+        }
       }}
       onKeyUp={(event) => {
         if (disabled || (event.key !== " " && event.key !== "Enter")) return;
         event.preventDefault();
         onHoldChange(false);
       }}
-      className={`flex h-6 w-6 flex-shrink-0 items-center justify-center rounded transition-colors ${
+      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded transition-colors ${
         active
-          ? "bg-studio-accent text-black"
+          ? "bg-studio-accent text-on-accent"
           : "text-panel-text-4 hover:bg-panel-hover hover:text-panel-text-1"
       } disabled:cursor-not-allowed disabled:opacity-40`}
       title="Hold to show original"
@@ -170,153 +131,53 @@ function HoldBeforeButton({
 }
 
 export function ColorGradingSection({
+  projectId,
   element,
   assets,
   previewIframeRef,
   onImportAssets,
   onSetAttributeLive,
+  onApplyScope,
 }: {
+  projectId: string;
   element: DomEditSelection;
   assets: string[];
   previewIframeRef?: RefObject<HTMLIFrameElement | null>;
   onImportAssets?: (files: FileList, dir?: string) => Promise<string[]>;
-  onSetAttributeLive: (attr: string, value: string | null) => void | Promise<void>;
+  onSetAttributeLive: (
+    attr: string,
+    value: string | null,
+    onSettled?: (ok: boolean) => void,
+  ) => void | Promise<void>;
+  onApplyScope?: (
+    scope: "source-file" | "project",
+    value: string | null,
+  ) => Promise<{ changedFiles: number; changedElements: number }>;
 }) {
-  const [grading, setGrading] = useState(() => readColorGradingFromElement(element));
-  const [compareEnabled, setCompareEnabled] = useState(false);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeColorGradingStatus>(() => ({
-    state: "pending",
-    message: "Waiting for runtime",
-  }));
-  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingPersistValueRef = useRef<string | null | undefined>(undefined);
-  const onSetAttributeLiveRef = useRef(onSetAttributeLive);
-  const compareEnabledRef = useRef(compareEnabled);
-  onSetAttributeLiveRef.current = onSetAttributeLive;
-  compareEnabledRef.current = compareEnabled;
-  const target = useMemo(
-    (): HfColorGradingTarget => ({
-      id: element.id ?? null,
-      hfId: element.hfId ?? null,
-      selector: element.selector ?? null,
-      selectorIndex: element.selectorIndex ?? null,
-    }),
-    [element.hfId, element.id, element.selector, element.selectorIndex],
-  );
-
-  const refreshRuntimeStatus = useCallback(() => {
-    setRuntimeStatus(readRuntimeColorGradingStatus(previewIframeRef?.current, target));
-  }, [previewIframeRef, target]);
-
-  useEffect(() => {
-    refreshRuntimeStatus();
-  }, [refreshRuntimeStatus]);
-
-  useEffect(() => {
-    const iframe = previewIframeRef?.current;
-    if (!iframe) return;
-    const refresh = () => {
-      window.setTimeout(refreshRuntimeStatus, 50);
-    };
-    iframe.addEventListener("load", refresh);
-    const timer = window.setTimeout(refreshRuntimeStatus, 80);
-    return () => {
-      iframe.removeEventListener("load", refresh);
-      window.clearTimeout(timer);
-    };
-  }, [previewIframeRef, refreshRuntimeStatus]);
-
-  useEffect(() => {
-    return () => {
-      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-      if (pendingPersistValueRef.current !== undefined) {
-        void onSetAttributeLiveRef.current(COLOR_GRADING_DATA_KEY, pendingPersistValueRef.current);
-        pendingPersistValueRef.current = undefined;
-      }
-    };
-  }, []);
-
-  const postColorGrading = useCallback(
-    (nextGrading: NormalizedHfColorGrading) => {
-      previewIframeRef?.current?.contentWindow?.postMessage(
-        {
-          source: "hf-parent",
-          type: "control",
-          action: "set-color-grading",
-          target,
-          grading: toBridgeColorGrading(nextGrading),
-        },
-        "*",
-      );
-    },
-    [previewIframeRef, target],
-  );
-
-  const postCompare = useCallback(
-    (enabled: boolean) => {
-      previewIframeRef?.current?.contentWindow?.postMessage(
-        {
-          source: "hf-parent",
-          type: "control",
-          action: "set-color-grading-compare",
-          target,
-          compare: {
-            enabled,
-            position: 1,
-            lineWidth: 0,
-          },
-        },
-        "*",
-      );
-    },
-    [previewIframeRef, target],
-  );
-
-  useEffect(
-    () => () => {
-      postCompare(false);
-    },
-    [postCompare],
-  );
-
-  const commitColorGrading = useCallback(
-    (nextGrading: NormalizedHfColorGrading) => {
-      setGrading(nextGrading);
-      setRuntimeStatus({ state: "pending", message: "Updating shader" });
-      postColorGrading(nextGrading);
-      const active = isHfColorGradingActive(nextGrading);
-      if (compareEnabledRef.current) {
-        postCompare(active);
-        if (!active) setCompareEnabled(false);
-      }
-      window.setTimeout(refreshRuntimeStatus, 50);
-      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-      pendingPersistValueRef.current = isHfColorGradingActive(nextGrading)
-        ? serializeHfColorGrading(nextGrading)
-        : null;
-      persistTimerRef.current = setTimeout(() => {
-        const value = pendingPersistValueRef.current;
-        pendingPersistValueRef.current = undefined;
-        void onSetAttributeLive(COLOR_GRADING_DATA_KEY, value ?? null);
-      }, 350);
-    },
-    [onSetAttributeLive, postColorGrading, postCompare, refreshRuntimeStatus],
-  );
-
-  const commitCompare = useCallback(
-    (enabled: boolean) => {
-      const nextEnabled = enabled && isHfColorGradingActive(grading);
-      setCompareEnabled(nextEnabled);
-      if (nextEnabled) postColorGrading(grading);
-      postCompare(nextEnabled);
-      window.setTimeout(refreshRuntimeStatus, 50);
-    },
-    [grading, postColorGrading, postCompare, refreshRuntimeStatus],
-  );
+  const track = useTrackDesignInput();
+  const {
+    grading,
+    compareEnabled,
+    applyScope,
+    applyBusy,
+    runtimeStatus,
+    mediaMetadata,
+    commitColorGrading,
+    commitCompare,
+    setApplyScope,
+    applyToScope,
+    resetGrading,
+  } = useColorGradingController({
+    projectId,
+    element,
+    previewIframeRef,
+    onSetAttributeLive,
+    onApplyScope,
+  });
 
   return (
     <Section
-      title="Color Grading"
+      title="Color grading"
       icon={<Palette size={15} />}
       accessory={
         <div className="flex min-w-0 items-center gap-1.5">
@@ -330,22 +191,54 @@ export function ColorGradingSection({
             type="button"
             onClick={(event) => {
               event.stopPropagation();
-              commitColorGrading(DEFAULT_COLOR_GRADING);
+              track("button", "Reset color grading");
+              resetGrading();
             }}
-            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-panel-text-4 transition-colors hover:bg-panel-hover hover:text-panel-text-1"
-            title="Reset grading"
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-panel-text-4 transition-colors hover:bg-panel-hover hover:text-panel-text-1"
+            title="Reset color grading"
           >
             <RotateCcw size={12} />
           </button>
         </div>
       }
     >
+      <HdrMediaWarning metadata={mediaMetadata} />
       <ColorGradingControls
         grading={grading}
         assets={assets}
         onImportAssets={onImportAssets}
         onCommitColorGrading={commitColorGrading}
       />
+      {onApplyScope && (
+        <div className="mt-4 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2">
+          <select
+            value={applyScope}
+            onChange={(event) => {
+              track("select", "Apply scope");
+              setApplyScope(event.currentTarget.value as typeof applyScope);
+            }}
+            disabled={applyBusy}
+            className="w-full min-w-0 rounded-md bg-panel-input px-3 py-2 text-[11px] font-medium text-panel-text-1 outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
+            title="Choose where to copy these color grading settings"
+          >
+            <option value="source-file">Current file media</option>
+            <option value="project">All project media</option>
+          </select>
+          <button
+            type="button"
+            disabled={applyBusy}
+            onClick={(event) => {
+              event.stopPropagation();
+              track("button", "Apply color grading scope");
+              void applyToScope();
+            }}
+            className="h-8 rounded-md bg-panel-input px-3 text-[11px] font-medium text-panel-text-2 transition-colors hover:bg-panel-hover hover:text-panel-text-1 disabled:cursor-not-allowed disabled:opacity-50"
+            title="Copy these color grading settings to the selected scope"
+          >
+            {applyBusy ? "Applying" : "Apply"}
+          </button>
+        </div>
+      )}
     </Section>
   );
 }

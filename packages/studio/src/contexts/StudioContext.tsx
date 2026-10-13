@@ -1,6 +1,8 @@
-import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type { TimelineElement } from "../player";
 import type { CompositionDimensions } from "../components/renders/RenderQueue";
+import type { FfmpegStatus } from "../components/renders/useFfmpegStatus";
+import { useContext, useMemo, type ReactNode } from "react";
+import { createStableContext } from "../utils/hmrStableContext";
 
 export interface StudioShellValue {
   projectId: string;
@@ -14,20 +16,36 @@ export interface StudioShellValue {
     undoLabel: string | undefined;
     redoLabel: string | undefined;
   };
+  /**
+   * Why a composition write would be refused right now, or null when writes
+   * are possible. Derived from the paused save queue and the external-file
+   * conflict state, both of which are otherwise banners with no lock behind
+   * them. One field rather than two, so there is one owner of the question.
+   */
+  writeBlockedReason: string | null;
   handleUndo: () => Promise<void>;
   handleRedo: () => Promise<void>;
   renderQueue: {
     jobs: unknown[];
     isRendering: boolean;
+    loadError: string | null;
+    actionError: string | null;
+    dismissActionError: () => void;
+    reloadRenders: () => void;
     deleteRender: (jobId: string) => void;
+    cancelRender: (jobId: string) => void;
     clearCompleted: () => void;
     startRender: (options: unknown) => Promise<void>;
+    /** Encoder availability. `null` means "no answer", not "missing". */
+    ffmpeg: FfmpegStatus | null;
+    /** True only when the server positively reported no usable FFmpeg. */
+    ffmpegMissing: boolean;
+    ffmpegChecking: boolean;
+    recheckFfmpeg: () => void;
   };
   compositionDimensions: CompositionDimensions | null;
   waitForPendingDomEditSaves: () => Promise<void>;
   handlePreviewIframeRef: (iframe: HTMLIFrameElement | null) => void;
-  timelineVisible: boolean;
-  toggleTimelineVisibility: () => void;
 }
 
 export interface StudioPlaybackValue {
@@ -42,13 +60,25 @@ export interface StudioPlaybackValue {
 
 export type StudioContextValue = StudioShellValue & StudioPlaybackValue;
 
-const StudioShellContext = createContext<StudioShellValue | null>(null);
-const StudioPlaybackContext = createContext<StudioPlaybackValue | null>(null);
+const StudioShellContext = createStableContext<StudioShellValue | null>("StudioShellContext", null);
+const StudioPlaybackContext = createStableContext<StudioPlaybackValue | null>(
+  "StudioPlaybackContext",
+  null,
+);
 
 export function useStudioShellContext(): StudioShellValue {
   const ctx = useContext(StudioShellContext);
   if (!ctx) throw new Error("useStudioShellContext must be used within StudioShellProvider");
   return ctx;
+}
+
+/**
+ * Optional access — returns null outside a provider. Lets the player-package
+ * <Timeline> (a public standalone export) read shell state when embedded in the
+ * NLE without hard-requiring the provider in standalone/test mounts.
+ */
+export function useStudioShellContextOptional(): StudioShellValue | null {
+  return useContext(StudioShellContext);
 }
 
 export function useStudioPlaybackContext(): StudioPlaybackValue {
@@ -57,7 +87,12 @@ export function useStudioPlaybackContext(): StudioPlaybackValue {
   return ctx;
 }
 
+export function useStudioPlaybackContextOptional(): StudioPlaybackValue | null {
+  return useContext(StudioPlaybackContext);
+}
+
 /** @deprecated Use useStudioShellContext and/or useStudioPlaybackContext instead. */
+// fallow-ignore-next-line unused-export
 export function useStudioContext(): StudioContextValue {
   const shell = useStudioShellContext();
   const playback = useStudioPlaybackContext();
@@ -78,14 +113,13 @@ export function StudioShellProvider({
     showToast,
     previewIframeRef,
     editHistory,
+    writeBlockedReason,
     handleUndo,
     handleRedo,
     renderQueue,
     compositionDimensions,
     waitForPendingDomEditSaves,
     handlePreviewIframeRef,
-    timelineVisible,
-    toggleTimelineVisibility,
   } = value;
 
   const stable = useMemo<StudioShellValue>(
@@ -96,30 +130,28 @@ export function StudioShellProvider({
       showToast,
       previewIframeRef,
       editHistory,
+      writeBlockedReason,
       handleUndo,
       handleRedo,
       renderQueue,
       compositionDimensions,
       waitForPendingDomEditSaves,
       handlePreviewIframeRef,
-      timelineVisible,
-      toggleTimelineVisibility,
     }),
     [
       projectId,
       activeCompPath,
       compositionDimensions,
-      timelineVisible,
       editHistory,
       renderQueue,
       setActiveCompPath,
       showToast,
       previewIframeRef,
+      writeBlockedReason,
       handleUndo,
       handleRedo,
       waitForPendingDomEditSaves,
       handlePreviewIframeRef,
-      toggleTimelineVisibility,
     ],
   );
   return <StudioShellContext value={stable}>{children}</StudioShellContext>;
@@ -166,6 +198,7 @@ export function StudioPlaybackProvider({
 }
 
 /** @deprecated Use StudioShellProvider and StudioPlaybackProvider instead. */
+// fallow-ignore-next-line unused-export
 export function StudioProvider({
   value,
   children,

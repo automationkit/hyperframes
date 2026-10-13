@@ -56,6 +56,14 @@ describe("buildDockerRunArgs", () => {
     `);
   });
 
+  it("tells the container its output reaches a terminal only when the host's stdout is one", () => {
+    const flags = (hostStdoutIsTty?: boolean) =>
+      buildDockerRunArgs({ ...FIXED_INPUT, hostStdoutIsTty, options: BASE }).slice(0, 4);
+    expect(flags(true)).toEqual(["run", "--rm", "-e", "HYPERFRAMES_STDOUT_IS_TTY=1"]);
+    expect(flags(false)).toEqual(["run", "--rm", "--platform", "linux/amd64"]);
+    expect(flags(undefined)).toEqual(["run", "--rm", "--platform", "linux/amd64"]);
+  });
+
   it("omits --workers when auto sizing should happen inside the container", () => {
     const args = buildDockerRunArgs({ ...FIXED_INPUT, options: BASE });
     expect(args).not.toContain("--workers");
@@ -172,7 +180,9 @@ describe("buildDockerRunArgs", () => {
         videoFrameFormat: "png",
         quiet: true,
         debug: true,
+        bestEffort: false,
         entryFile: "compositions/intro.html",
+        experimentalFastCapture: true,
       },
     });
     // Each value must reach the container exactly once. If a future option
@@ -190,11 +200,45 @@ describe("buildDockerRunArgs", () => {
     expect(args).toContain("png");
     expect(args).toContain("--quiet");
     expect(args).toContain("--debug");
+    expect(args).toContain("--no-best-effort");
     expect(args).toContain("--gpu");
     expect(args).toContain("--no-browser-gpu");
     expect(args).toContain("--hdr");
     expect(args).toContain("--composition");
     expect(args).toContain("compositions/intro.html");
+    expect(args).toContain("--experimental-fast-capture");
+  });
+
+  it("forwards only an explicit strict-readiness opt-in", () => {
+    const compatible = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, bestEffort: true },
+    });
+    expect(compatible).not.toContain("--best-effort");
+    expect(compatible).not.toContain("--no-best-effort");
+
+    const strict = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, bestEffort: false },
+    });
+    expect(strict).toContain("--no-best-effort");
+  });
+
+  it("forwards --experimental-fast-capture only when enabled", () => {
+    const on = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, experimentalFastCapture: true },
+    });
+    expect(on).toContain("--experimental-fast-capture");
+
+    const off = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, experimentalFastCapture: false },
+    });
+    expect(off).not.toContain("--experimental-fast-capture");
+
+    const absent = buildDockerRunArgs({ ...FIXED_INPUT, options: BASE });
+    expect(absent).not.toContain("--experimental-fast-capture");
   });
 
   it("forwards --format png-sequence to the container", () => {
@@ -206,6 +250,24 @@ describe("buildDockerRunArgs", () => {
     const formatIdx = args.indexOf("--format");
     expect(formatIdx).toBeGreaterThanOrEqual(0);
     expect(args[formatIdx + 1]).toBe("png-sequence");
+  });
+
+  it("forwards --format hls and --hls-segment-seconds to the container", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      outputFilename: "stream",
+      options: { ...BASE, format: "hls", hlsSegmentSeconds: 6 },
+    });
+    const formatIdx = args.indexOf("--format");
+    const segmentIdx = args.indexOf("--hls-segment-seconds");
+    expect(args[formatIdx + 1]).toBe("hls");
+    expect(args[segmentIdx + 1]).toBe("6");
+  });
+
+  it("omits --hls-segment-seconds for other formats", () => {
+    expect(buildDockerRunArgs({ ...FIXED_INPUT, options: BASE })).not.toContain(
+      "--hls-segment-seconds",
+    );
   });
 
   it("forwards --format gif and --gif-loop to the container", () => {
@@ -308,6 +370,22 @@ describe("buildDockerRunArgs", () => {
     expect(args).not.toContain("--browser-timeout");
   });
 
+  it("forwards protocol and player-ready timeouts without unit conversion", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: {
+        ...BASE,
+        protocolTimeoutMs: 240_000,
+        playerReadyTimeoutMs: 90_000,
+      },
+    });
+
+    expect(args).toContain("--protocol-timeout");
+    expect(args[args.indexOf("--protocol-timeout") + 1]).toBe("240000");
+    expect(args).toContain("--player-ready-timeout");
+    expect(args[args.indexOf("--player-ready-timeout") + 1]).toBe("90000");
+  });
+
   it("forwards rational --fps verbatim (NTSC 30000/1001)", () => {
     // Regression for the fps fraction-syntax feature: the rational form must
     // survive the host → container hop as a single `30000/1001` argument so
@@ -339,6 +417,26 @@ describe("buildDockerRunArgs", () => {
     const idx = args.indexOf("--resolution");
     expect(idx).toBeGreaterThan(-1);
     expect(args[idx + 1]).toBe("landscape-4k");
+  });
+
+  it("forwards the RAW aspect-agnostic alias `1080p` verbatim (does not pre-normalize to `landscape`)", () => {
+    // Miga R2 important note on PR #2529: Docker correctness now depends on
+    // forwarding the raw alias string, not the canonical preset — the
+    // in-container CLI re-runs `normalizeResolutionFlag` +
+    // `isAspectAgnosticResolutionAlias` so aspect-agnostic aliases keep
+    // their orientation-adaptive behavior. A future refactor that
+    // silently substitutes the normalized preset here would restore the
+    // portrait-only Docker failure this test pins against.
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, outputResolution: "1080p" },
+    });
+    const idx = args.indexOf("--resolution");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toBe("1080p");
+    // Belt-and-braces: the normalized preset name must NOT slip in as a
+    // second value that would confuse citty parsing on the container side.
+    expect(args).not.toContain("landscape");
   });
 
   it("omits --resolution when outputResolution is not set", () => {

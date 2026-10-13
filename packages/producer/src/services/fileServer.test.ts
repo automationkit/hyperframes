@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   closeFileServerSafely,
   createFileServer,
+  RENDER_CAPTURE_MODE_SHIM,
   HF_BRIDGE_SCRIPT,
   HF_EARLY_STUB,
   injectScriptsAtHeadStart,
@@ -94,7 +95,7 @@ describe("injectScriptsIntoHtml", () => {
 </html>`;
 
     const injected = injectScriptsAtHeadStart(html, [VIRTUAL_TIME_SHIM]);
-    const injectedShimTag = `<script>${VIRTUAL_TIME_SHIM}</script>`;
+    const injectedShimTag = `<script>${VIRTUAL_TIME_SHIM}\n//# sourceURL=hyperframes://injected/0</script>`;
     const authoredHeadTag = `<script>window.__order = ["authored-head"];</script>`;
 
     expect(injected.indexOf(injectedShimTag)).toBeGreaterThanOrEqual(0);
@@ -315,6 +316,81 @@ describe("parseRangeHeader", () => {
 });
 
 describe("createFileServer", () => {
+  it.each([
+    ["avif", "image/avif"],
+    ["flac", "audio/flac"],
+    ["M4A", "audio/mp4"],
+    ["mov", "video/quicktime"],
+    ["ico", "image/vnd.microsoft.icon"],
+  ])("serves .%s media with its content type for full and range requests", async (ext, type) => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-media-content-type-"));
+    const bytes = new Uint8Array([0, 255, 128, 64, 32]);
+    try {
+      writeFileSync(join(projectDir, `asset.${ext}`), bytes);
+      await withFileServer(projectDir, async (server) => {
+        const response = await fetch(`${server.url}/asset.${ext}`);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("content-type")).toBe(type);
+        expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+
+        const partial = await fetch(`${server.url}/asset.${ext}`, {
+          headers: { Range: "bytes=1-3" },
+        });
+        expect(partial.status).toBe(206);
+        expect(partial.headers.get("content-type")).toBe(type);
+        expect(partial.headers.get("content-range")).toBe("bytes 1-3/5");
+        expect(new Uint8Array(await partial.arrayBuffer())).toEqual(bytes.slice(1, 4));
+      });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks producer pages as render capture before the runtime loads", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-render-mode-"));
+    try {
+      writeFileSync(
+        join(projectDir, "index.html"),
+        "<!doctype html><html><head></head><body></body></html>",
+      );
+      const runtimeScript = "globalThis.__hfRuntimeLoaded = true;";
+      const server = await createFileServer({
+        projectDir,
+        preHeadScripts: [],
+        headScripts: [runtimeScript],
+      });
+      try {
+        const response = await fetch(`${server.url}/index.html`);
+        expect(response.status).toBe(200);
+        const html = await response.text();
+        expect(html).toContain(RENDER_CAPTURE_MODE_SHIM);
+        expect(html.indexOf(RENDER_CAPTURE_MODE_SHIM)).toBeLessThan(html.indexOf(runtimeScript));
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serves ES modules with a JavaScript MIME type", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-mjs-"));
+    try {
+      writeEmptyIndex(projectDir);
+      writeFileSync(join(projectDir, "scene.mjs"), "export const scene = true;");
+      const server = await createFileServer({ projectDir, preHeadScripts: [], headScripts: [] });
+      try {
+        const response = await fetch(`${server.url}/scene.mjs`);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   async function expectInjectedRenderFps(
     fps: Parameters<typeof createFileServer>[0]["fps"],
     expected: {
@@ -641,6 +717,49 @@ describe("HF_EARLY_STUB + HF_BRIDGE_SCRIPT integration", () => {
 
     sandbox.window.__renderReady = true;
     expect(sandbox.window.__hf?.duration).toBe(30);
+  });
+
+  it("forwards suppressEvents from __hf.seek to renderSeek", () => {
+    const renderSeekCalls: Array<[number, { suppressEvents?: boolean } | undefined]> = [];
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: {
+          seek?: (t: number, options?: { suppressEvents?: boolean }) => void;
+          duration?: number;
+        };
+        __player?: {
+          renderSeek: (t: number, options?: { suppressEvents?: boolean }) => void;
+          getDuration: () => number;
+        };
+        setInterval: typeof setInterval;
+        clearInterval: typeof clearInterval;
+      };
+      document: { querySelector: () => null };
+    } = {
+      window: {
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+      },
+      document: { querySelector: () => null },
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.__renderReady = true;
+    sandbox.window.__player = {
+      renderSeek: (time, options) => {
+        renderSeekCalls.push([time, options]);
+      },
+      getDuration: () => 10,
+    };
+
+    new Function("window", "document", `with (window) {\n${HF_BRIDGE_SCRIPT}\n}`)(
+      sandbox.window,
+      sandbox.document,
+    );
+
+    sandbox.window.__hf?.seek?.(5, { suppressEvents: true });
+
+    expect(renderSeekCalls).toEqual([[5, { suppressEvents: true }]]);
   });
 
   it("keeps render-time timeline seeks synchronous during large renders", () => {

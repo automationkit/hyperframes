@@ -1,6 +1,7 @@
 import { useState, useRef, type CSSProperties } from "react";
 import { useMountEffect } from "../hooks/useMountEffect";
 import { type AgentModalAnchorPoint, clampNumber } from "../utils/studioHelpers";
+import { useDialogBehavior } from "./ui/useDialogBehavior";
 
 function getAgentModalPositionStyle(
   anchorPoint: AgentModalAnchorPoint | null,
@@ -24,22 +25,33 @@ function getAgentModalPositionStyle(
   return { left, top, transform: "translateX(-50%)" };
 }
 
+export interface AskAgentModalProps {
+  selectionLabel: string;
+  contextPreview?: string;
+  anchorPoint?: AgentModalAnchorPoint | null;
+  onSubmit: (instruction: string) => void;
+  onClose: () => void;
+}
+
 export function AskAgentModal({
   selectionLabel,
   contextPreview,
   anchorPoint = null,
   onSubmit,
   onClose,
-}: {
-  selectionLabel: string;
-  contextPreview?: string;
-  anchorPoint?: AgentModalAnchorPoint | null;
-  onSubmit: (instruction: string) => void;
-  onClose: () => void;
-}) {
+}: AskAgentModalProps) {
   const [value, setValue] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const modalPositionStyle = getAgentModalPositionStyle(anchorPoint);
+  // A dirty draft vetoes Escape/backdrop closes — a stray click must not
+  // discard typed instructions. The X button and Copy still close directly.
+  const { requestClose } = useDialogBehavior({
+    open: true,
+    onClose,
+    containerRef,
+    canClose: () => !value.trim(),
+  });
 
   useMountEffect(() => {
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -54,13 +66,18 @@ export function AskAgentModal({
     <div
       className={
         anchorPoint
-          ? "fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm"
-          : "fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          ? "hf-backdrop-in fixed inset-0 z-100 bg-black/60 backdrop-blur-xs"
+          : "hf-backdrop-in fixed inset-0 z-100 flex items-center justify-center bg-black/60 backdrop-blur-xs"
       }
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
-        className={`w-[480px] rounded-2xl border border-neutral-800 bg-neutral-950 shadow-2xl ${
+        ref={containerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Copy prompt to AI agent"
+        tabIndex={-1}
+        className={`w-[480px] rounded-2xl border border-neutral-800 bg-neutral-950 shadow-2xl outline-hidden ${
           anchorPoint ? "fixed" : ""
         }`}
         style={modalPositionStyle}
@@ -74,8 +91,9 @@ export function AskAgentModal({
             </p>
           </div>
           <button
-            className="p-1 rounded-md text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50"
+            className="p-1 rounded-md text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 active:scale-[0.98]"
             onClick={onClose}
+            aria-label="Close"
           >
             <svg
               width="14"
@@ -94,13 +112,14 @@ export function AskAgentModal({
         <div className="px-5 py-4 space-y-3">
           <textarea
             ref={inputRef}
-            className="w-full h-24 px-3 py-2 rounded-lg border border-neutral-800 bg-neutral-900/60 text-sm text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-studio-accent/60 focus:ring-1 focus:ring-studio-accent/30"
+            className="w-full h-24 px-3 py-2 rounded-lg border border-neutral-800 bg-neutral-900/60 text-sm text-neutral-200 placeholder-neutral-600 resize-none focus:outline-hidden focus:border-studio-accent/60 focus:ring-1 focus:ring-studio-accent/30"
             placeholder="Describe what you want to change…"
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleSubmit();
-              if (e.key === "Escape") onClose();
+              // Escape is handled at the document level by useDialogBehavior,
+              // guarded against discarding a dirty draft.
             }}
           />
           {contextPreview && (
@@ -108,7 +127,7 @@ export function AskAgentModal({
               <summary className="text-[11px] text-neutral-500 cursor-pointer select-none hover:text-neutral-400">
                 Context included in prompt
               </summary>
-              <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-neutral-900/80 px-3 py-2 text-[11px] leading-relaxed text-neutral-500 whitespace-pre-wrap break-words border border-neutral-800/50">
+              <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-neutral-900/80 px-3 py-2 text-[11px] leading-relaxed text-neutral-500 whitespace-pre-wrap wrap-break-word border border-neutral-800/50">
                 {contextPreview}
               </pre>
             </details>
@@ -119,7 +138,7 @@ export function AskAgentModal({
             {navigator.platform.includes("Mac") ? "⌘" : "Ctrl"}+Enter to copy
           </span>
           <button
-            className="px-4 py-1.5 rounded-lg bg-studio-accent/90 text-xs font-medium text-neutral-950 hover:bg-studio-accent disabled:opacity-40 disabled:cursor-not-allowed"
+            className="px-4 py-1.5 rounded-lg bg-accent text-xs font-medium text-on-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed"
             disabled={!value.trim()}
             onClick={handleSubmit}
           >

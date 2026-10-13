@@ -4,6 +4,7 @@ import {
   isElementComputedVisible,
   resolveAllVisualDomEditTargets,
 } from "../components/editor/domEditingElement";
+import { isHtmlElement } from "../components/editor/domEditingDom";
 import { getEventTargetElement } from "./studioHelpers";
 
 interface PreviewLocalPointer {
@@ -20,6 +21,15 @@ interface PreviewLocalPointer {
 // should remain canvas-selectable.
 const FULL_BLEED_RATIO = 0.95;
 
+// Media leaves (a hero/background video, a full-bleed image, an <svg>/<canvas>
+// backdrop) ARE the content a user clicks — they must stay canvas-selectable even
+// at full-bleed. Only empty containers (scene wrappers, layout backdrops) get
+// excluded. Without this, a full-bleed <video> is skipped and the click lands on
+// whatever sits behind it — the reported "can't select videos / selects the layer
+// behind" bug (and the "needs a second click" symptom, where the first click
+// resolves through the video to nothing and only the hover fallback recovers).
+const FULL_BLEED_SELECTABLE_MEDIA_TAGS = new Set(["video", "img", "canvas", "svg"]);
+
 export function coversComposition(
   elRect: { width: number; height: number },
   viewport: DomEditViewport,
@@ -32,6 +42,7 @@ export function coversComposition(
 }
 
 function isFullBleedTarget(el: HTMLElement, viewport: DomEditViewport): boolean {
+  if (FULL_BLEED_SELECTABLE_MEDIA_TAGS.has(el.tagName.toLowerCase())) return false;
   return coversComposition(el.getBoundingClientRect(), viewport);
 }
 
@@ -59,26 +70,82 @@ function resolvePreviewLocalPointer(
   };
 }
 
-const POINTER_EVENTS_OVERRIDE_ID = "__hf_studio_pointer_events_override__";
+const pointerEventsInheritanceFallbackByDocument = new WeakMap<Document, boolean>();
 
-function forcePointerEventsAuto(doc: Document): HTMLStyleElement | null {
-  try {
-    const style = doc.createElement("style");
-    style.id = POINTER_EVENTS_OVERRIDE_ID;
-    style.textContent = "* { pointer-events: auto !important; }";
-    doc.head.appendChild(style);
-    return style;
-  } catch {
-    return null;
-  }
+function needsPointerEventsInheritanceFallback(doc: Document, win: Window): boolean {
+  const cached = pointerEventsInheritanceFallbackByDocument.get(doc);
+  if (cached !== undefined) return cached;
+
+  const parent = doc.createElement("div");
+  const child = doc.createElement("div");
+  parent.style.pointerEvents = "none";
+  parent.appendChild(child);
+  const host = doc.body ?? doc.documentElement;
+  if (!host) return false;
+
+  host.appendChild(parent);
+  const needsFallback = win.getComputedStyle(child).pointerEvents !== "none";
+  parent.remove();
+  pointerEventsInheritanceFallbackByDocument.set(doc, needsFallback);
+  return needsFallback;
 }
 
-function removePointerEventsOverride(style: HTMLStyleElement | null): void {
-  try {
-    style?.remove();
-  } catch {
-    // cross-origin or detached doc
+// Own declared pointer-events value, via computed style rather than inline
+// style, so a CSS-class opt-in/opt-out (not just an inline style attribute)
+// is honored when walking back down from a pointer-events:none ancestor.
+function hasOwnPointerEventsOverride(el: HTMLElement, win: Window): boolean {
+  const value = win.getComputedStyle(el).pointerEvents;
+  return value !== "" && value !== "inherit" && value !== "unset";
+}
+
+function inheritsPointerEventsNoneFromAncestor(el: HTMLElement, win: Window): boolean {
+  let current = el.parentElement;
+  while (current) {
+    if (win.getComputedStyle(current).pointerEvents === "none") {
+      let descendant: HTMLElement | null = el;
+      while (descendant && descendant !== current) {
+        if (hasOwnPointerEventsOverride(descendant, win)) {
+          return win.getComputedStyle(descendant).pointerEvents === "none";
+        }
+        descendant = descendant.parentElement;
+      }
+      return true;
+    }
+    current = current.parentElement;
   }
+  return false;
+}
+
+function hasAuthorPointerEventsNone(el: HTMLElement): boolean {
+  const win = el.ownerDocument.defaultView;
+  if (!win) return false;
+  if (win.getComputedStyle(el).pointerEvents === "none") return true;
+  if (!needsPointerEventsInheritanceFallback(el.ownerDocument, win)) return false;
+  return inheritsPointerEventsNoneFromAncestor(el, win);
+}
+
+function collectPointerEventsNoneTargets(
+  elements: Iterable<Element | null | undefined>,
+): WeakSet<HTMLElement> {
+  const disabled = new WeakSet<HTMLElement>();
+  for (const entry of elements) {
+    if (isHtmlElement(entry) && hasAuthorPointerEventsNone(entry)) {
+      disabled.add(entry);
+    }
+  }
+  return disabled;
+}
+
+// Shared tail of both pointer resolvers: hit-test candidates minus elements the
+// author hid from hit-testing via pointer-events:none.
+function filterAuthorInteractiveTargets(
+  elements: Element[],
+  activeCompositionPath: string | null,
+): HTMLElement[] {
+  const pointerEventsNoneTargets = collectPointerEventsNoneTargets(elements);
+  return resolveAllVisualDomEditTargets(elements, { activeCompositionPath }).filter(
+    (el) => !pointerEventsNoneTargets.has(el),
+  );
 }
 
 // Animated group members can move outside their wrapper's static layout box, so
@@ -86,6 +153,7 @@ function removePointerEventsOverride(style: HTMLStyleElement | null): void {
 // draws) doesn't hit-test to the group via elementsFromPoint. Recover it: if the
 // point falls within a group's live member-union rect, return that wrapper.
 // Innermost (smallest-area) group wins for nested groups.
+// fallow-ignore-next-line complexity
 function findGroupAtPoint(doc: Document, x: number, y: number): HTMLElement | null {
   let best: HTMLElement | null = null;
   let bestArea = Infinity;
@@ -132,32 +200,33 @@ export function getPreviewTargetFromPointer(
   const localPointer = resolvePreviewLocalPointer(iframe, doc, win, clientX, clientY);
   if (!localPointer) return null;
 
-  const overrideStyle = forcePointerEventsAuto(doc);
-  try {
-    if (typeof doc.elementsFromPoint === "function") {
-      const candidates = resolveAllVisualDomEditTargets(
-        doc.elementsFromPoint(localPointer.x, localPointer.y),
-        { activeCompositionPath },
-      );
-      const visualTarget =
-        candidates.find((el) => !isFullBleedTarget(el, localPointer.viewport)) ?? null;
-      if (visualTarget) return visualTarget;
-    }
-
-    // No element hit (e.g. empty space inside an animated group's overlay) — fall
-    // back to the group whose member-union contains the point, so the whole group
-    // area is hoverable/selectable, not just where a member currently sits.
-    const groupHit = findGroupAtPoint(doc, localPointer.x, localPointer.y);
-    if (groupHit && getDomLayerPatchTarget(groupHit, activeCompositionPath)) return groupHit;
-
-    const fallback = getEventTargetElement(doc.elementFromPoint(localPointer.x, localPointer.y));
-    if (!fallback || !getDomLayerPatchTarget(fallback, activeCompositionPath)) return null;
-    if (!isElementComputedVisible(fallback)) return null;
-    if (isFullBleedTarget(fallback, localPointer.viewport)) return null;
-    return fallback;
-  } finally {
-    removePointerEventsOverride(overrideStyle);
+  // Hit-test without touching the preview document: any style added here, even
+  // briefly, restyles every element in the film on each click and hover.
+  if (typeof doc.elementsFromPoint === "function") {
+    const elements = doc.elementsFromPoint(localPointer.x, localPointer.y);
+    const candidates = filterAuthorInteractiveTargets(elements, activeCompositionPath);
+    const visualTarget =
+      candidates.find((el) => !isFullBleedTarget(el, localPointer.viewport)) ?? null;
+    if (visualTarget) return visualTarget;
   }
+
+  // No element hit (e.g. empty space inside an animated group's overlay) — fall
+  // back to the group whose member-union contains the point, so the whole group
+  // area is hoverable/selectable, not just where a member currently sits.
+  const groupHit = findGroupAtPoint(doc, localPointer.x, localPointer.y);
+  if (
+    groupHit &&
+    !hasAuthorPointerEventsNone(groupHit) &&
+    getDomLayerPatchTarget(groupHit, activeCompositionPath)
+  )
+    return groupHit;
+
+  const fallback = getEventTargetElement(doc.elementFromPoint(localPointer.x, localPointer.y));
+  if (!fallback || !getDomLayerPatchTarget(fallback, activeCompositionPath)) return null;
+  if (hasAuthorPointerEventsNone(fallback)) return null;
+  if (!isElementComputedVisible(fallback)) return null;
+  if (isFullBleedTarget(fallback, localPointer.viewport)) return null;
+  return fallback;
 }
 
 /** Returns all independently-selectable elements at the pointer (topmost first). */
@@ -180,21 +249,18 @@ export function getAllPreviewTargetsFromPointer(
   const localPointer = resolvePreviewLocalPointer(iframe, doc, win, clientX, clientY);
   if (!localPointer) return [];
 
-  const overrideStyle = forcePointerEventsAuto(doc);
-  try {
-    if (typeof doc.elementsFromPoint === "function") {
-      return resolveAllVisualDomEditTargets(doc.elementsFromPoint(localPointer.x, localPointer.y), {
-        activeCompositionPath,
-      }).filter((el) => !isFullBleedTarget(el, localPointer.viewport));
-    }
-    const fallback = getEventTargetElement(doc.elementFromPoint(localPointer.x, localPointer.y));
-    if (!fallback || !getDomLayerPatchTarget(fallback, activeCompositionPath)) return [];
-    if (!isElementComputedVisible(fallback)) return [];
-    if (isFullBleedTarget(fallback, localPointer.viewport)) return [];
-    return [fallback];
-  } finally {
-    removePointerEventsOverride(overrideStyle);
+  if (typeof doc.elementsFromPoint === "function") {
+    const elements = doc.elementsFromPoint(localPointer.x, localPointer.y);
+    return filterAuthorInteractiveTargets(elements, activeCompositionPath).filter(
+      (el) => !isFullBleedTarget(el, localPointer.viewport),
+    );
   }
+  const fallback = getEventTargetElement(doc.elementFromPoint(localPointer.x, localPointer.y));
+  if (!fallback || !getDomLayerPatchTarget(fallback, activeCompositionPath)) return [];
+  if (hasAuthorPointerEventsNone(fallback)) return [];
+  if (!isElementComputedVisible(fallback)) return [];
+  if (isFullBleedTarget(fallback, localPointer.viewport)) return [];
+  return [fallback];
 }
 
 function objectLike(value: unknown): object | null {

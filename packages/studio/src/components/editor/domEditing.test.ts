@@ -17,6 +17,7 @@ import {
   resolveDomEditCapabilities,
   resolveDomEditSelection,
 } from "./domEditing";
+import { buildElementLabel, normalizeTimelineCompositionSource } from "./domEditingDom";
 
 function createDocument(markup: string): Document {
   const window = new Window();
@@ -76,6 +77,7 @@ describe("resolveDomEditCapabilities", () => {
       canEditStyles: true,
       canMove: true,
       canResize: true,
+      canCrop: true,
       canApplyManualOffset: true,
       canApplyManualSize: true,
       canApplyManualRotation: true,
@@ -424,6 +426,7 @@ describe("resolveDomEditSelection", () => {
       canEditStyles: false,
       canMove: true,
       canResize: true,
+      canCrop: true,
       canApplyManualOffset: false,
       canApplyManualSize: false,
       canApplyManualRotation: false,
@@ -737,6 +740,40 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.selector).toBe("#copy");
   });
 
+  it("keeps a transparent overflow mask structural when directly selecting its headline", async () => {
+    const document = createDocument(`
+      <template id="source-template"></template>
+      <section class="hl-block">
+        <div class="hl-mask" style="overflow: hidden; background: transparent">
+          <h1 class="hl-text">Launch title</h1>
+        </div>
+      </section>
+    `);
+    const headline = document.querySelector<HTMLElement>(".hl-text")!;
+    setElementRect(headline, { left: 44, top: 52, width: 220, height: 48 });
+    const selection = await resolveDomEditSelection(headline, {
+      activeCompositionPath: "index.html",
+      isMasterView: false,
+      preferClipAncestor: false,
+    });
+
+    expect(selection?.element).toBe(headline);
+    expect(selection?.selector).toBe(".hl-text");
+    expect(selection?.textFields).toMatchObject([{ source: "self", tagName: "h1" }]);
+    expect(selection?.boundingBox).toEqual({ x: 44, y: 52, width: 220, height: 48 });
+    // Explicit layer navigation remains free to resolve the structural mask.
+    const mask = document.querySelector<HTMLElement>(".hl-mask")!;
+    expect(
+      (
+        await resolveDomEditSelection(mask, {
+          activeCompositionPath: "index.html",
+          isMasterView: false,
+          preferClipAncestor: false,
+        })
+      )?.element,
+    ).toBe(mask);
+  });
+
   // fallow-ignore-next-line code-duplication
   it("collects simple child text blocks as separate editable fields", async () => {
     const document = createDocument(`
@@ -872,6 +909,42 @@ describe("resolveDomEditSelection", () => {
     });
 
     expect(first).not.toBe(second);
+  });
+
+  it("reads a preview prefix only from a URL, not from a project folder named preview", () => {
+    expect(normalizeTimelineCompositionSource("sections/preview/x.html")).toBe(
+      "sections/preview/x.html",
+    );
+    expect(
+      normalizeTimelineCompositionSource(
+        "http://localhost:5190/api/projects/p/preview/sections/x.html",
+      ),
+    ).toBe("sections/x.html");
+    expect(normalizeTimelineCompositionSource("/api/projects/p/preview/comp/sections/x.html")).toBe(
+      "sections/x.html",
+    );
+  });
+
+  it("names a repeated section by its authored id, not its runtime instance id", () => {
+    const document = createDocument(`
+      <div data-composition-id="benefit-fresh__hf2" data-hf-original-composition-id="benefit-fresh"></div>
+    `);
+
+    expect(buildElementLabel(document.querySelector("div") as HTMLElement)).toBe("Benefit Fresh");
+  });
+
+  it("finds a composition host authored with a ./ path", () => {
+    const document = createDocument(`
+      <div data-composition-id="scene" data-composition-file="./compositions/scene.html"></div>
+    `);
+
+    expect(
+      findElementForTimelineElement(
+        document,
+        { id: "scene", compositionSrc: "./compositions/scene.html" },
+        { activeCompositionPath: null, isMasterView: true },
+      )?.getAttribute("data-composition-id"),
+    ).toBe("scene");
   });
 
   it("resolves generated timeline ids without throwing", () => {
@@ -1067,7 +1140,7 @@ describe("patch builders and prompt builder", () => {
     expect(prompt).toContain("Computed styles (browser-resolved):");
     expect(prompt).toContain("Target HTML:");
     expect(prompt).toContain("Guardrails:");
-    expect(prompt).toContain("Do not modify other elements' data-* attributes or positioning.");
+    expect(prompt).toContain("Do not modify other elements' data-* attributes or positioning");
   });
 
   it("uses an absolute source path in copied agent prompts when provided", () => {
